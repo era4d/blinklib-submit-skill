@@ -18,7 +18,7 @@ import {
 } from './blink-runner-transport.mjs';
 import { synchronizeInstalledSkill } from './blink-skill-manager.mjs';
 
-const CLIENT_VERSION = '1.9.0';
+const CLIENT_VERSION = '1.9.1';
 const here = dirname(fileURLToPath(import.meta.url));
 const client = resolve(here, 'blink-automation.mjs');
 const terminalResultStatuses = new Set([
@@ -62,6 +62,15 @@ const googleLoginPolicy = Object.freeze({
   accountSelection: 'saved_preference_or_sole_signed_in',
   allowSignup: 'only_when_authorized',
   preserveProviderOnFailure: false,
+  postLoginNavigation: Object.freeze({
+    required: true,
+    targetField: 'submissionUrl',
+    action: 'navigate_task_tab_to_exact_submission_url',
+    preservePathQueryAndFragment: true,
+    waitForPageAndEmbeddedForm: true,
+    reinspectAfterNavigation: true,
+    continueOriginalAction: true,
+  }),
   onUnsuccessfulLogin:
     'close_task_tab_and_auth_popups_only_when_no_form_progress',
   onAuthenticatedInterruption: 'preserve_if_any_form_progress_and_continue',
@@ -736,6 +745,7 @@ export async function runSequentialSession(io, options = {}) {
           type: 'browser_action_required',
           action: 'open_and_inspect',
           requestId: inspectRequestId,
+          submissionUrl: task.submissionUrl,
           task: browserTask,
           loginPolicy: googleLoginPolicy,
           interactionPolicy: browserInteractionPolicy,
@@ -763,8 +773,10 @@ export async function runSequentialSession(io, options = {}) {
             requestId: fillRequestId,
             runId: task.runId,
             tabId,
+            submissionUrl: task.submissionUrl,
             currentUrl,
             plan,
+            loginPolicy: googleLoginPolicy,
             interactionPolicy: browserInteractionPolicy,
           },
           (receipt) =>
@@ -805,7 +817,9 @@ export async function runSequentialSession(io, options = {}) {
                 requestId: reinspectionId,
                 runId: task.runId,
                 tabId,
+                submissionUrl: task.submissionUrl,
                 currentUrl: fill.currentUrl || currentUrl,
+                loginPolicy: googleLoginPolicy,
                 interactionPolicy: browserInteractionPolicy,
               },
               inspectionError
@@ -842,6 +856,7 @@ export async function runSequentialSession(io, options = {}) {
               requestId: decisionRequestId,
               runId: task.runId,
               tabId,
+              submissionUrl: task.submissionUrl,
               currentUrl,
               unresolved: plan.unresolved,
               fieldAnswers: task.fieldAnswers,

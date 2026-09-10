@@ -36,7 +36,7 @@ Blink API commands need outbound network access. In a restricted shell, request 
 - `reinspect`: return fresh controls after navigation or stale selectors.
 - `resolve_then_submit_or_block`: fill unresolved authorized fields, ordinary Next/Continue, approved uploads, required standard terms/privacy, and one final Submit; otherwise return one concrete blocker.
 
-On a login wall, try the visible Google path once using the saved preference or the sole eligible signed-in account. Multiple accounts, credentials, verification, consent review, provider errors, and unconfirmed callbacks are failed login attempts. Close their task tabs and popups only when the form is untouched; preserve any tab where a question was already filled.
+On a login wall, try the visible Google path once using the saved preference or the sole eligible signed-in account. After authentication is visibly confirmed, automatically navigate the task tab to the request's exact `submissionUrl` (the queued external-link URL, including its path, query, and fragment), wait for the page and embedded form, reinspect, and continue the original action. An OAuth callback that lands on a homepage, account page, or dashboard is not a reason to stop or search that page for the form. Multiple accounts, credentials, verification, consent review, provider errors, and unconfirmed callbacks are failed login attempts. Close their task tabs and popups only when the form is untouched; preserve any tab where a question was already filled.
 
 Read [references/automatic-browser.md](references/automatic-browser.md) for receipt shapes and automatic field rules.
 

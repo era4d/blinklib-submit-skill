@@ -1,6 +1,6 @@
 {
   "skillId": "backlink-submit",
   "name": "Blink Backlink Submit",
-  "version": "1.9.0",
+  "version": "1.9.1",
   "repository": "https://github.com/era4d/blinklib-submit-skill.git"
 }

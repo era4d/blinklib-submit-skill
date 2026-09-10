@@ -21,7 +21,7 @@ Use the bundled atomic updater from the installed Skill directory:
 
 ```bash
 node scripts/blink-skill-manager.mjs git-update
-node scripts/blink-skill-manager.mjs git-update --ref v1.9.0
+node scripts/blink-skill-manager.mjs git-update --ref v1.9.1
 node scripts/blink-skill-manager.mjs rollback
 ```
 
@@ -38,5 +38,5 @@ A clean Git checkout can also be updated conventionally:
 git pull --ff-only
 ```
 
-Version tags such as `v1.9.0` are immutable release points; `main` is the latest
+Version tags such as `v1.9.1` are immutable release points; `main` is the latest
 published release.

@@ -23,7 +23,7 @@ import time
 import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 MCP_PACKAGE = "chrome-devtools-mcp@1.8.0"
 HERE = Path(__file__).resolve().parent
 PURPOSE_FIELDS = {"logo": "logoUrl", "preview": "previewImageUrl", "screenshots": "screenshotUrls"}
@@ -229,7 +229,7 @@ class McpClient:
             cursor = result.get("nextCursor")
             if not cursor:
                 break
-        for name in ["list_pages", "new_page", "take_snapshot", "upload_file"]:
+        for name in ["list_pages", "new_page", "navigate_page", "take_snapshot", "upload_file"]:
             if name not in self.tools:
                 raise Blocked("incompatible_browser", f"Chrome MCP does not expose {name}.")
 
@@ -518,6 +518,32 @@ def inspect_account_menu(client, page_id, snapshot, inspected):
     return snapshot
 
 
+def revisit_submission_page(client, page_id, url, trace=None):
+    """Return the authenticated task tab to its exact queued submission URL."""
+    target = web_url(url)
+    client.call("navigate_page", pageId=page_id, type="url", url=target)
+    pages = pages_from(client.call("list_pages"))
+    page = next((item for item in pages if item["id"] == page_id), None)
+    if not page:
+        raise Blocked(
+            "page_closed",
+            "The authenticated task tab closed before its submission URL could be reinspected.",
+        )
+    if not hasattr(client, "page_bindings"):
+        client.page_bindings = {}
+    client.page_bindings[normalize_url(target)] = page_id
+    if trace is not None:
+        trace.append(
+            {
+                "stage": "submission_url_revisited",
+                "pageId": page_id,
+                "targetUrl": target,
+            }
+        )
+    snapshot = client.call("take_snapshot", pageId=page_id)
+    return page, snapshot
+
+
 def google_login(client, args):
     preference = login_preference(args.url)
     def is_google(url):
@@ -538,7 +564,15 @@ def google_login(client, args):
         inspected = set()
         snapshot = inspect_account_menu(client, page["id"], snapshot, inspected)
         if authenticated_snapshot(snapshot):
-            return {"status": "login_completed", "pageUrl": page["url"], "evidence": "Visible sign-out control; Google login prompt absent."}
+            page, snapshot = revisit_submission_page(client, page["id"], args.url)
+            return {
+                "status": "login_completed",
+                "pageUrl": page["url"],
+                "submissionUrl": args.url,
+                "submissionUrlRevisited": True,
+                "snapshot": snapshot,
+                "evidence": "Visible authenticated account state was confirmed, then the exact submission URL was reopened and reinspected.",
+            }
         if any(is_google(p["url"]) for p in before_pages):
             return {"status": "existing_google_window", "message": "An existing Google window prevents a unique attempt. Close this task tab, leave unrelated windows unchanged, defer, and continue."}
         buttons = google_signin_controls(snapshot, allow_registration=preference["registrationAllowed"])
@@ -615,7 +649,17 @@ def google_login(client, args):
             if authenticated_snapshot(snapshot):
                 state["trace"].append({"stage": "site_login_verified", "pageId": source["id"]})
                 client.call("select_page", pageId=source["id"], bringToFront=True)
-                return outcome("login_completed", "The original site shows a sign-out control and no Google login prompt.", pageUrl=source["url"])
+                source, submission_snapshot = revisit_submission_page(
+                    client, source["id"], args.url, state["trace"]
+                )
+                return outcome(
+                    "login_completed",
+                    "The site login was confirmed; the exact submission URL was reopened and reinspected.",
+                    pageUrl=source["url"],
+                    submissionUrl=args.url,
+                    submissionUrlRevisited=True,
+                    snapshot=submission_snapshot,
+                )
             if state["providerId"] is not None:
                 returned_polls += 1
                 if returned_polls >= 5:
@@ -676,7 +720,7 @@ def parse_args(argv=None):
     sub.add_parser("session-stop", help="Explicitly end the persistent MCP connection; preserve Chrome.")
     sub.add_parser("browser-tools", help="Read this connection's supported tool schemas before using browser-call.")
     bridge = sub.add_parser("browser-call", help="Use a supported browser tool through the same persistent MCP connection.")
-    bridge.add_argument("--tool", required=True, choices=["list_pages", "select_page", "take_snapshot", "click", "fill", "fill_form", "press_key", "hover", "evaluate_script", "take_screenshot"])
+    bridge.add_argument("--tool", required=True, choices=["list_pages", "select_page", "navigate_page", "take_snapshot", "click", "fill", "fill_form", "press_key", "hover", "evaluate_script", "take_screenshot"])
     bridge.add_argument("--arguments-json", default="{}", help="Exact JSON arguments matching this MCP tool's schema; never mix page/UIDs from another connection.")
     sub.add_parser("doctor", help="Connect to existing Chrome and check required tools.")
     preferences = sub.add_parser("login-preferences", help="Read the current user's saved login choice without starting Chrome.")

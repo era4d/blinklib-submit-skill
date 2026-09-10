@@ -15,7 +15,7 @@ import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-const CLIENT_VERSION = '1.9.0';
+const CLIENT_VERSION = '1.9.1';
 const SKILL_ID = 'backlink-submit';
 const MAX_RELEASE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_HISTORY_LIMIT = 3;
@@ -535,7 +535,7 @@ async function activateGitRelease(stageRoot, details, connection, options = {}) 
 }
 
 async function synchronizeGitInstalledSkill(options = {}) {
-  const { connection } = await connectionFor(options);
+  const { connection, connectionPath } = await connectionFor(options);
   const { repository, ref } = gitSourceFor(connection, options);
   const installed = await readJson(join(skillRoot, '.blink-release.json')).catch(
     () => ({})
@@ -550,6 +550,52 @@ async function synchronizeGitInstalledSkill(options = {}) {
     return {
       action: 'current',
       source: 'git',
+      version: CLIENT_VERSION,
+      repository,
+      ref,
+      commit: remoteCommit,
+      skillRoot,
+    };
+  }
+
+  const localCommit = await git(['-C', skillRoot, 'rev-parse', 'HEAD'])
+    .then(({ stdout }) => stdout.trim())
+    .catch(() => null);
+  if (localCommit === remoteCommit) {
+    const localRelease = await validateGitRelease(skillRoot);
+    if (localRelease.version !== CLIENT_VERSION) {
+      throw new Error(
+        `Git checkout metadata says ${localRelease.version}, but the running Skill says ${CLIENT_VERSION}.`
+      );
+    }
+    const nextConnection = {
+      ...connection,
+      clientVersion: CLIENT_VERSION,
+      updateSource: 'git',
+      gitRepository: repository,
+      gitRef: ref,
+    };
+    if (options.version || options.pin) {
+      nextConnection.pinnedVersion = CLIENT_VERSION;
+    } else {
+      delete nextConnection.pinnedVersion;
+    }
+    await writeFile(
+      connectionPath,
+      `${JSON.stringify(nextConnection, null, 2)}\n`,
+      { encoding: 'utf8', mode: 0o600 }
+    );
+    await writeInstallationMetadata(skillRoot, {
+      version: CLIENT_VERSION,
+      source: 'git',
+      repository,
+      gitRef: ref,
+      gitCommit: remoteCommit,
+    });
+    return {
+      action: 'current',
+      source: 'git',
+      adoptedCheckout: true,
       version: CLIENT_VERSION,
       repository,
       ref,
