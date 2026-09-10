@@ -4,7 +4,7 @@ import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { auditLog, auditResult, auditTask, RESULT_STATUSES } from './blink-audit.mjs';
 
-const CLIENT_VERSION = '1.9.1';
+const CLIENT_VERSION = '1.9.2';
 // Older clients may have cached raw profile images instead of API-resolved assets.
 const PRODUCT_CACHE_VERSION = 3;
 

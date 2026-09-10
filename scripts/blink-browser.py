@@ -23,7 +23,7 @@ import time
 import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 
-VERSION = "1.9.1"
+VERSION = "1.9.2"
 MCP_PACKAGE = "chrome-devtools-mcp@1.8.0"
 HERE = Path(__file__).resolve().parent
 PURPOSE_FIELDS = {"logo": "logoUrl", "preview": "previewImageUrl", "screenshots": "screenshotUrls"}

@@ -43,7 +43,7 @@ If any question was filled, an upload was accepted, or a form step advanced befo
 
 1. Keep the progressed task tab; close completed provider popups and duplicate tabs.
 2. Confirm the visible domain matches the queued task.
-3. Preserve the task page as the handoff. Bring each preserved task page to the foreground when reporting it at batch end.
+3. Preserve the task page as the handoff. In Codex's in-app browser, call the exact tab's `markHandoff()` after the deferral is acknowledged and again before every turn end until work resumes or the task is settled; simply leaving an agent-created tab open is insufficient. Bring each preserved task page to the foreground when reporting it at batch end.
 4. Add the site and exact remaining step to the batch-end report; do not interrupt while runnable work remains.
 5. Do not ask for credentials in chat. Do not inspect or enter passwords, OTPs, recovery codes, Passkeys, security keys, password-manager contents, cookies, or session storage.
 6. Keep the Blink task in the matching user-action state. The controller must acknowledge the deferral before taking another task.
