@@ -1,0 +1,15 @@
+connection.json
+.blink-release.json
+.env
+.env.*
+!.env.example
+data/
+node_modules/
+.output/
+.nitro/
+src/paraglide/
+src/routeTree.gen.ts
+npm-debug.log*
+.DS_Store
+__pycache__/
+*.pyc

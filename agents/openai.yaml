@@ -1,0 +1,4 @@
+interface:
+  display_name: "Backlink Submit"
+  short_description: "Continuously submit authorized Blink queues"
+  default_prompt: "Use $backlink-submit to run authorized automatic queues without mid-run questions, close only untouched failed-login and completed tabs, preserve every unfinished form after any question is filled, and report after the batch drains."
