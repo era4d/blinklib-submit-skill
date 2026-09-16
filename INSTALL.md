@@ -12,7 +12,7 @@ Blink must export one complete `backlink-submit` package. Keep `SKILL.md`, `scri
 - A browser-control skill or tool that can inspect and fill forms.
 - A browser surface that can close task tabs and preserve one unfinished tab with material progress when needed.
 
-The Skill never reads browser passwords or cookies. Manual login, CAPTCHA, 2FA, Passkeys, and password managers remain under user control.
+The Skill never reads browser passwords or cookies. Manual login, CAPTCHA, 2FA, Passkeys, and password managers remain under user control. When the user explicitly chooses an existing AdsPower desktop profile, the bundled Local API adapter may start that exact profile in visible mode; it does not modify the profile or operate CAPTCHA-solving extensions.
 
 ## Blink-provisioned connection
 
@@ -45,7 +45,7 @@ Import or install the downloaded Blink package with WorkBuddy's Skill installati
 
 WorkBuddy `web-access` may create background CDP tabs. Automatic mode can use those tabs. Untouched failed-login tabs are closed; every materially progressed unfinished form is preserved and foregrounded at batch end when supported.
 
-Do not pair this Skill with CAPTCHA-solving, browser-barrier bypass, proxy rotation, or stealth-login helpers.
+Do not pair this Skill with CAPTCHA-solving, browser-barrier bypass, proxy rotation, fingerprint-evasion, or stealth-login helpers. AdsPower support is limited to an explicitly selected visible profile and loopback CDP connection as documented in `references/adspower.md`.
 
 ## Automatic execution
 
@@ -59,7 +59,7 @@ The Skill reuses connected Remote Chrome, or automatically selects the built-in 
 
 Version 1.9.1 and newer supports both Blink's server-managed release channel and the official Git repository at `https://github.com/era4d/blinklib-submit-skill`. Before each new controller starts, the selected source is checked and a changed release is installed atomically while three local versions are retained. API releases are SHA-256 verified. Git releases are cloned without an interactive credential prompt, resolved to an exact commit, checked for required files and unsafe symbolic links, and then activated.
 
-Use `node scripts/blink-skill-manager.mjs check` to inspect the selected source, `update` to follow Blink's API default, `git-update` to switch to GitHub `main`, `git-update --ref v1.9.2` to install and pin a release tag, or `rollback` to restore and pin the newest retained local version. Once `git-update` succeeds, future automatic startup checks use GitHub until `update --source api` switches back. A server administrator can independently move the API default pointer to an older immutable release. Editing only the version in `connection.json` does not upgrade the executable.
+Use `node scripts/blink-skill-manager.mjs check` to inspect the selected source, `update` to follow Blink's API default, `git-update` to switch to GitHub `main`, `git-update --ref v1.9.3` to install and pin a release tag, or `rollback` to restore and pin the newest retained local version. Once `git-update` succeeds, future automatic startup checks use GitHub until `update --source api` switches back. A server administrator can independently move the API default pointer to an older immutable release. Editing only the version in `connection.json` does not upgrade the executable.
 
 An installation cloned directly from GitHub may also use ordinary `git pull --ff-only` while its tracked files are clean. `connection.json` and `.blink-release.json` are ignored and must never be committed. The bundled `git-update` command is preferred when atomic switching and local rollback history are desired.
 

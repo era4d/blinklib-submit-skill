@@ -260,7 +260,7 @@ curl -sS -X POST "$BLINK_APP_URL/api/backlink-automation/claim/reject" \
 node "<SKILL_DIR>/scripts/blink-automation.mjs" version
 ```
 
-This is a local check and does not print the API key. The current downloadable client is `1.9.2`. `minimumClientVersion` is a compatibility baseline and does not stop historical clients. `recommendedClientVersion` reports the latest API package; version 1.9.1 and newer synchronize from the configured API or Git source before a new run starts. `configuredClientVersion` is installation metadata and does not override the actual script version.
+This is a local check and does not print the API key. The current downloadable client is `1.9.3`. `minimumClientVersion` is a compatibility baseline and does not stop historical clients. `recommendedClientVersion` reports the latest API package; version 1.9.1 and newer synchronize from the configured API or Git source before a new run starts. `configuredClientVersion` is installation metadata and does not override the actual script version.
 
 The version manager uses the installation's existing credential:
 
@@ -268,10 +268,10 @@ The version manager uses the installation's existing credential:
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" check
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" versions
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" update
-node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" update --version 1.9.2
+node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" update --version 1.9.3
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" git-check
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" git-update
-node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" git-update --ref v1.9.2
+node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" git-update --ref v1.9.3
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" update --source api
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" rollback
 ```
@@ -575,7 +575,7 @@ If `upload_file` rejects a project directory, use the installed runtime's docume
     "code": "SKILL_UPDATE_RECOMMENDED",
     "required": false,
     "installedVersion": "1.7.28",
-    "recommendedVersion": "1.9.2",
+    "recommendedVersion": "1.9.3",
     "remindWhen": "campaign_finished",
     "message": "..."
   }

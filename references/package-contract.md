@@ -25,6 +25,7 @@ backlink-submit/
 |-- agents/
 |   `-- openai.yaml
 |-- scripts/
+|   |-- adspower-session.mjs
 |   |-- blink-audit.mjs
 |   |-- blink-browser.py
 |   |-- blink_session.py
@@ -34,6 +35,7 @@ backlink-submit/
 |   |-- blink-skill-manager.mjs
 |   `-- blink-automation.mjs
 `-- references/
+    |-- adspower.md
     |-- api.md
     |-- automatic-browser.md
     |-- browser-execution.md
@@ -58,7 +60,7 @@ Blink writes `connection.json` at download time with:
   "schemaVersion": 1,
   "appUrl": "https://blink.example",
   "apiKey": "<scoped-install-token>",
-  "clientVersion": "1.9.2"
+  "clientVersion": "1.9.3"
 }
 ```
 

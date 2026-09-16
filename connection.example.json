@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "appUrl": "https://your-blink-instance.example",
   "apiKey": "replace-with-your-scoped-install-key",
-  "clientVersion": "1.9.2",
+  "clientVersion": "1.9.3",
   "updateSource": "git",
   "gitRepository": "https://github.com/era4d/blinklib-submit-skill.git",
   "gitRef": "main"

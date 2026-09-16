@@ -1,6 +1,6 @@
 ---
 name: backlink-submit
-description: Run or resume authorized Blink backlink queues without mid-run questions, close untouched failed-login and completed tabs, preserve every unfinished form after any question is filled, and report once the batch drains. Requires the packaged Blink client and a browser runtime. Do not discover unqueued sites, solve verification challenges, make payments, create accounts, add reciprocal links, or alter third-party systems outside the queued form.
+description: Run or resume authorized Blink backlink queues through a supported browser or an explicitly requested AdsPower profile, preserve every progressed unfinished form, and report once the batch drains. Requires the packaged Blink client and a browser runtime. Do not discover unqueued sites, automate comments, solve verification challenges, evade site controls, make payments, create accounts, add reciprocal links, or alter third-party systems outside the queued form.
 metadata:
   compatibility: Works with Codex, Claude Code, and WorkBuddy. Requires Node.js 18+, a reachable Blink API, and a supported browser-control runtime.
 ---
@@ -22,7 +22,7 @@ These rules override more specific examples in supporting references:
 ## Run the controller
 
 1. Resolve packaged files relative to this `SKILL.md`. Pass `connection.json` by path; never print or read it into model context.
-2. Use an already connected Remote Chrome browser, otherwise a visible in-app browser tab. For Codex, an in-app/CUA tab is a browser surface; do not load native Windows Computer Use guidance for it.
+2. Use an explicitly requested AdsPower profile, an already connected Remote Chrome browser, or otherwise a visible in-app browser tab. AdsPower remains an assisted visible adapter and never authorizes challenge solving, profile mutation, proxy rotation, or fingerprint evasion. For Codex, an in-app/CUA tab is a browser surface; do not load native Windows Computer Use guidance for it.
 3. Start or reconnect with `node "<SKILL_DIR>/scripts/blink-sequential-runner.mjs" start`. Before a new controller starts, the runner synchronizes from the installation's selected update source (Blink API by default, or the official Git repository after `git-update`) and retains the prior local version for rollback. API releases are SHA-256 verified; Git releases are resolved to an exact commit and validated before an atomic switch. Add `--queue-id ID` only when the user scoped a queue. Do not start a second controller or call `queue`, `next`, `defer`, or `result` manually while it owns the campaign.
 4. Alternate `status` and `respond --receipt-file PATH`: execute `pendingRequest`, save one JSON receipt, respond, then read status again. The controller owns leases, heartbeats, validation, settlement, and queue rotation.
 5. Continue through `receipt_delivered`, `task_settled`, `receipt_rejected`, `delivery_retry`, and `runner_waiting`. Finish only on `campaign_finished`, `runner_failed`, `runner_stopped`, or `runner_recovery_required`. Repair rejected receipts from observed state; never repeat Submit or an ambiguous browser action. Before a Codex turn ends, reacquire every still-preserved in-app tab by its exact stable tab ID, call `tab.markHandoff()` on each one, make the browser visible, and report the matching remaining action. Do not mark completed, untouched, provider-popup, or unrelated tabs.
@@ -46,7 +46,7 @@ Read [references/automatic-browser.md](references/automatic-browser.md) for rece
 - Use prepared answers. Compose only the controller-listed open-ended fields from `productContext`. Leave optional unknown facts blank; return `missing_required_fact` for required unknown facts and continue the queue.
 - When `authorization.assetUpload` is true, matching API assets are downloaded automatically to a unique system-temp directory. For every staged file control, use the exact `uploads[].files[].path` with the active browser's documented upload API, verify the selected filename/thumbnail/completed state, and return its `uploadReceipts` entry before any result or unrelated blocker. `uploaded: false` means attachment is still mandatory; never open Explorer, leave a native picker waiting, or ask the user to locate the image. Missing or rejected assets are blockers, not reasons to interrupt.
 - Do not invent identity, contact, pricing, legal, financial, metric, credential, verification, customer, date, integration, or commitment facts.
-- Do not solve CAPTCHA, Turnstile, OTP, Passkey, security warnings, email verification, payment, account creation, reciprocal linking, or domain verification. Return the matching blocker and continue.
+- Do not submit comments or guestbook posts merely to place a link. Do not solve CAPTCHA, Turnstile, hCaptcha, CleanTalk, OTP, Passkey, security warnings, email verification, payment, account creation, reciprocal linking, or domain verification. Do not inspect, click, or configure solving extensions or inject challenge tokens. Return the matching blocker and continue.
 - Runtime confirmation or denial is valid only when the active browser tool actually returns it. Never change browser backends to evade a denial.
 
 Valid blockers are `captcha`, `login_required`, `email_verification`, `missing_required_fact`, `asset_missing`, `asset_rejected`, `runtime_confirmation_required`, `runtime_denial`, `browser_failure`, and `assisted_final_review`. Ordinary automatic form steps are not blockers.
@@ -62,4 +62,5 @@ On abnormal exit, keep saved receipts, release only the owned lease, and apply t
 - Read [references/result-contract.md](references/result-contract.md) only for a non-obvious result.
 - Read [references/integrity-and-recovery.md](references/integrity-and-recovery.md) only for ambiguous lease or delivery state.
 - Read [references/platform-adapters.md](references/platform-adapters.md) only when selecting or recovering a browser backend.
+- Read [references/adspower.md](references/adspower.md) only when the user explicitly requests an existing AdsPower profile.
 - Read [references/api.md](references/api.md), [references/python-runner.md](references/python-runner.md), or [references/package-contract.md](references/package-contract.md) only for their named diagnostic or packaging purpose.
