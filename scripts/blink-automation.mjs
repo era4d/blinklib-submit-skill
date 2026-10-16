@@ -1,10 +1,10 @@
-import { mkdir, mkdtemp, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { auditLog, auditResult, auditTask, RESULT_STATUSES } from './blink-audit.mjs';
 
-const CLIENT_VERSION = '1.9.6';
+const CLIENT_VERSION = '1.9.7';
 // Older clients may have cached raw profile images instead of API-resolved assets.
 const PRODUCT_CACHE_VERSION = 3;
 
@@ -350,8 +350,44 @@ if (command !== 'version' && (!baseUrl || !apiKey)) {
 }
 if (baseUrl) safeHttpUrl(baseUrl, 'Blink app URL');
 
+// Keep only bounded diagnostic receipts, never request bodies, URLs with queries,
+// API keys or raw error text. A failed connection cannot report itself immediately.
+function diagnosticDirectory() {
+  return join(dirname(productCachePath()), 'diagnostics', connectionCacheKey());
+}
+async function queueTransportDiagnostic(receipt) {
+  try {
+    const directory = diagnosticDirectory();
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const files = (await readdir(directory)).filter((name) => name.endsWith('.json')).sort();
+    if (files.length >= 100) await unlink(join(directory, files[0])).catch(() => {});
+    await writeFile(join(directory, `${receipt.requestId}.json`), JSON.stringify(receipt), { mode: 0o600, flag: 'wx' });
+  } catch { /* Diagnostics must never change command or replay semantics. */ }
+}
+async function flushTransportDiagnostics() {
+  try {
+    const directory = diagnosticDirectory();
+    const files = pendingDiagnosticFiles.slice(0, 10);
+    for (const name of files) {
+      const path = join(directory, name);
+      const receipt = JSON.parse(await readFile(path, 'utf8'));
+      if (Date.now() - Date.parse(receipt.occurredAt) > 30 * 86400000) { await unlink(path); continue; }
+      const response = await fetch(`${baseUrl}/api/backlink-automation/diagnostics`, {
+        method: 'POST', redirect: 'error', signal: AbortSignal.timeout(3000),
+        headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json', 'x-blink-client-version': CLIENT_VERSION, 'x-blink-request-id': randomUUID() },
+        body: JSON.stringify(receipt),
+      });
+      const envelope = await response.json();
+      if (!response.ok || envelope.code !== 0) break;
+      await unlink(path).catch(() => {});
+    }
+  } catch { /* Retry receipt delivery on a later successful command only. */ }
+}
+
 async function request(path, options = {}, timeoutMs = 30_000) {
   const controller = new AbortController();
+  const requestId = randomUUID();
+  const startedAt = Date.now();
   let reader;
   const timeout = setTimeout(() => {
     controller.abort();
@@ -369,6 +405,7 @@ async function request(path, options = {}, timeoutMs = 30_000) {
         ...(options.body instanceof FormData ? {} : { 'content-type': 'application/json' }),
         'x-blink-client-version': CLIENT_VERSION,
         ...options.headers,
+        'x-blink-request-id': requestId,
       },
     });
     // Keep the deadline active until the body has finished, not just the headers.
@@ -400,6 +437,18 @@ async function request(path, options = {}, timeoutMs = 30_000) {
     }
     return envelope.data;
   } catch (error) {
+    if (!error.kind || error.kind === 'invalid_response' || error.kind === 'api_error') {
+      let body = {};
+      try { if (typeof options.body === 'string') body = JSON.parse(options.body); } catch {}
+      const validId = (value) => typeof value === 'string' && /^[\w.:-]{1,200}$/.test(value) ? value : undefined;
+      await queueTransportDiagnostic({
+        requestId, method: options.method || 'GET', path: path.split('?')[0],
+        kind: controller.signal.aborted ? 'timeout' : error.kind === 'api_error' ? 'api_error' : error.kind === 'invalid_response' ? 'invalid_response' : 'network',
+        errorCode: typeof error.action?.code === 'string' && /^[A-Z0-9_]{1,100}$/.test(error.action.code) ? error.action.code : undefined,
+        durationMs: Date.now() - startedAt, occurredAt: new Date(startedAt).toISOString(), httpStatus: error.httpStatus || 0,
+        runId: validId(body.runId), projectId: validId(body.projectId),
+      });
+    }
     if (error.kind) throw error;
     throw Object.assign(new Error('Blink request failed: network error, redirect, or timeout.'), { kind: 'transport_error' });
   } finally {
@@ -668,6 +717,10 @@ async function prepareClaim(task) {
   return { ...hydrated.task, clientAudit };
 }
 
+// Flush only receipts from a previous invocation, after this command completes.
+// A lost write response must finish reconciliation before any diagnostic traffic.
+let pendingDiagnosticFiles = [];
+try { pendingDiagnosticFiles = (await readdir(diagnosticDirectory())).filter((name) => /^[a-f0-9-]{36}\.json$/.test(name)); } catch {}
 let result;
 try {
 switch (command) {
@@ -1144,4 +1197,5 @@ switch (command) {
 }
 
 result = await storeClaimOutput(result, command, argument('claim-dir'));
+if (command !== 'version' && process.exitCode !== 1) await flushTransportDiagnostics();
 process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

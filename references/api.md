@@ -260,7 +260,7 @@ curl -sS -X POST "$BLINK_APP_URL/api/backlink-automation/claim/reject" \
 node "<SKILL_DIR>/scripts/blink-automation.mjs" version
 ```
 
-This is a local check and does not print the API key. The current downloadable client is `1.9.6`. `minimumClientVersion` is a compatibility baseline and does not stop historical clients. `recommendedClientVersion` reports the latest API package; version 1.9.1 and newer synchronize from the configured API or Git source before a new run starts. `configuredClientVersion` is installation metadata and does not override the actual script version.
+This is a local check and does not print the API key. The current downloadable client is `1.9.7`. `minimumClientVersion` is a compatibility baseline and does not stop historical clients. `recommendedClientVersion` reports the latest API package; version 1.9.1 and newer synchronize from the configured API or Git source before a new run starts. `configuredClientVersion` is installation metadata and does not override the actual script version.
 
 The version manager uses the installation's existing credential:
 
@@ -268,10 +268,10 @@ The version manager uses the installation's existing credential:
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" check
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" versions
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" update
-node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" update --version 1.9.6
+node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" update --version 1.9.7
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" git-check
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" git-update
-node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" git-update --ref v1.9.6
+node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" git-update --ref v1.9.7
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" update --source api
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" rollback
 ```
@@ -575,7 +575,7 @@ If `upload_file` rejects a project directory, use the installed runtime's docume
     "code": "SKILL_UPDATE_RECOMMENDED",
     "required": false,
     "installedVersion": "1.7.28",
-    "recommendedVersion": "1.9.6",
+    "recommendedVersion": "1.9.7",
     "remindWhen": "campaign_finished",
     "message": "..."
   }
@@ -583,3 +583,10 @@ If `upload_file` rejects a project directory, use the installed runtime's docume
 ```
 
 The notice never blocks queue, claim, resume, project hydration, event, or result operations. Carry it through the run and display the message once only after the queue reaches its normal terminal event.
+
+
+## Request diagnostics (1.9.4)
+
+Every automation request includes an `x-blink-request-id` for admin correlation. The server records Skill/API receipts, including authentication failures and failures before a task is claimed. Diagnostics contain only endpoint paths, bounded identifiers, response codes, and timing; never authorization headers, form answers, or raw request bodies.
+
+Transport timeouts, non-JSON responses and structured API errors are queued locally as sanitized diagnostic receipts (maximum 100). After a successful command, the client delivers up to ten receipts to `POST /api/backlink-automation/diagnostics`. Reports older than 30 days expire. The server deduplicates fallback API-error reports against an existing server failure receipt. Diagnostic delivery never retries the original submission and cannot settle a run. A server receipt can confirm a commit even if the client lost its response; reconcile that task before retrying. Older clients still receive server-side request auditing, but only 1.9.4+ clients provide offline/lost-response reports.

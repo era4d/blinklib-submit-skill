@@ -4,7 +4,7 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 
-const CLIENT_VERSION = '1.9.6';
+const CLIENT_VERSION = '1.9.7';
 const DEFAULT_API_BASE = 'http://127.0.0.1:50325';
 const REQUEST_TIMEOUT_MS = 30_000;
 const LIFECYCLE_INTERVAL_MS = 1_100;
@@ -271,6 +271,7 @@ async function stop(config) {
     path: '/api/v2/browser-profile/stop',
     body: { profile_id: config.profileId },
   });
+
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     await sleep(1_000);
