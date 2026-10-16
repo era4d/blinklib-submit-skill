@@ -6,7 +6,7 @@ The program uses the official MCP stdio protocol and `--autoConnect`. Version 1.
 
 ## Commands
 
-This is the Chrome backend, not the default fallback for an unavailable remote-debugging browser. In that case, use the runtime's built-in browser as specified in [platform selection](platform-adapters.md#browser-selection-order). Start this broker only when Python Chrome is explicitly selected; reuse it when already active.
+This is the optional Chrome backend, used only when explicitly selected or already active. The default order for new browser work is **Tabbit → built-in browser**, as specified in [platform selection](platform-adapters.md#browser-selection-order); Chrome is not an automatic fallback. Start this broker only when Python Chrome is explicitly selected; reuse it when already active.
 
 Ordinary CLI commands automatically reuse the same broker. If Remote Chrome is already controlling this task, keep that existing connection and its direct upload workflow instead of starting a second Python MCP. For the Python backend, the first browser command starts its broker and may show Chrome's native Allow dialog; subsequent commands reuse it.
 

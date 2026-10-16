@@ -6,8 +6,9 @@ Blink must export one complete `backlink-submit` package. Keep `SKILL.md`, `scri
 
 ## Requirements
 
-- Python 3.10+ for the bundled browser runner; no pip dependencies.
-- Node.js with npm/npx compatible with the pinned Chrome DevTools MCP. The API-only client requires Node.js 18+.
+- Node.js 18+ for the packaged Blink client.
+- The default browser order is **Tabbit → built-in browser**. Use Tabbit with the installed `tabbit` skill and stable CLI; if unavailable, use a compatible built-in browser directly. Remote Chrome is not an automatic fallback.
+- Python 3.10+ and Node.js with npm/npx compatible with the pinned Chrome DevTools MCP are required only for the optional bundled Chrome runner; no pip dependencies.
 - A reachable Blink application API.
 - A browser-control skill or tool that can inspect and fill forms.
 - A browser surface that can close task tabs and preserve one unfinished tab with material progress when needed.
@@ -41,7 +42,7 @@ The bundled Python runner handles Chrome connection, page opening and image uplo
 
 ## WorkBuddy
 
-Import or install the downloaded Blink package with WorkBuddy's Skill installation mechanism. Preserve the complete package and its relative layout. Prefer an installed Remote Chrome capability as the browser adapter; use `web-access` as a compatible fallback following `references/platform-adapters.md` and the selected adapter's dependency preflight.
+Import or install the downloaded Blink package with WorkBuddy's Skill installation mechanism. Preserve the complete package and its relative layout. Prefer the installed `tabbit` skill and stable CLI, then a compatible built-in browser, following `references/platform-adapters.md` and the selected adapter's dependency preflight. A separate `web-access` or Remote Chrome adapter is used only when explicitly requested or resuming existing work.
 
 WorkBuddy `web-access` may create background CDP tabs. Automatic mode can use those tabs. Untouched failed-login tabs are closed; every materially progressed unfinished form is preserved and foregrounded at batch end when supported.
 
@@ -53,13 +54,13 @@ New and edited queues use automatic execution only. Saving the configuration aut
 
 Start or reconnect with `node scripts/blink-sequential-runner.mjs start`. Read `status`, execute its pending browser request, write a UTF-8 JSON receipt file, and run `respond --receipt-file PATH`. Repeat until the controller reports batch completion or a batch handoff. A detached hidden process owns claims and heartbeats; no interactive terminal is needed. It survives individual shell calls, but browser actions still require the host agent to keep working. A host cancellation or disconnected browser cannot be called a completed batch.
 
-The Skill reuses connected Remote Chrome, or automatically selects the built-in browser when no remote-debugging browser is available. No-login tasks run first. On a login wall it tries the existing Google session once and verifies authentication. Unconfirmed login attempts close their task and provider tabs and rotate without a user question. A later blocker on an authenticated task, or an interruption after material form progress, may keep one tab for batch-end handoff.
+For new work, the Skill uses **Tabbit → built-in browser**. An explicit browser choice takes precedence; existing tasks resume in their original browser. No-login tasks run first. On a login wall it tries the selected browser's existing Google session once and verifies authentication. Unconfirmed login attempts close their task and provider tabs and rotate without a user question. Every materially progressed unfinished form is preserved for batch-end handoff.
 
 ## Installation failures
 
 Version 1.9.1 and newer supports both Blink's server-managed release channel and the official Git repository at `https://github.com/era4d/blinklib-submit-skill`. Before each new controller starts, the selected source is checked and a changed release is installed atomically while three local versions are retained. API releases are SHA-256 verified. Git releases are cloned without an interactive credential prompt, resolved to an exact commit, checked for required files and unsafe symbolic links, and then activated.
 
-Use `node scripts/blink-skill-manager.mjs check` to inspect the selected source, `update` to follow Blink's API default, `git-update` to switch to GitHub `main`, `git-update --ref v1.9.3` to install and pin a release tag, or `rollback` to restore and pin the newest retained local version. Once `git-update` succeeds, future automatic startup checks use GitHub until `update --source api` switches back. A server administrator can independently move the API default pointer to an older immutable release. Editing only the version in `connection.json` does not upgrade the executable.
+Use `node scripts/blink-skill-manager.mjs check` to inspect the selected source, `update` to follow Blink's API default, `git-update` to switch to GitHub `main`, `git-update --ref v1.9.6` to install and pin a release tag, or `rollback` to restore and pin the newest retained local version. Once `git-update` succeeds, future automatic startup checks use GitHub until `update --source api` switches back. A server administrator can independently move the API default pointer to an older immutable release. Editing only the version in `connection.json` does not upgrade the executable.
 
 An installation cloned directly from GitHub may also use ordinary `git pull --ff-only` while its tracked files are clean. `connection.json` and `.blink-release.json` are ignored and must never be committed. The bundled `git-update` command is preferred when atomic switching and local rollback history are desired.
 
@@ -69,4 +70,4 @@ If an agent reports that a script or reference is missing, reinstall the origina
 
 Users do not need to configure upload directories, TEMP variables, or MCP workspace roots for the supported same-host Chrome DevTools connection. The installed Skill fetches project images through its bundled Blink connection, automatically stages them in the operating system temporary directory, calls the browser upload operation, and verifies the result. Windows, macOS, and Linux paths are selected by Node; no username or drive is hardcoded.
 
-Reuse connected Remote Chrome; if unavailable, use the built-in browser's documented upload operation with matching API images. Do not start Python Chrome merely to upload in the built-in browser. For an explicitly chosen or already active Python backend, the [Python runner](references/python-runner.md) retains a broker/MCP across commands and stdin EOF. Users do not configure a port, MCP entry or image paths. `session-status` checks it; `session-stop` disconnects only when requested. Remote browsers need their documented file-transfer capability; missing upload capabilities are reported while preserving the form.
+Use the selected browser's documented upload operation with matching API images. The default order for new work is **Tabbit → built-in browser**. Do not start Python Chrome merely to upload in Tabbit or the built-in browser. For an explicitly chosen or already active Python backend, the [Python runner](references/python-runner.md) retains a broker/MCP across commands and stdin EOF. Users do not configure a port, MCP entry or image paths. `session-status` checks it; `session-stop` disconnects only when requested. Remote browsers need their documented file-transfer capability; missing upload capabilities are reported while preserving the form.

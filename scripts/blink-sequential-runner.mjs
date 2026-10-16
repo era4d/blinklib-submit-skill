@@ -18,7 +18,7 @@ import {
 } from './blink-runner-transport.mjs';
 import { synchronizeInstalledSkill } from './blink-skill-manager.mjs';
 
-const CLIENT_VERSION = '1.9.3';
+const CLIENT_VERSION = '1.9.6';
 const here = dirname(fileURLToPath(import.meta.url));
 const client = resolve(here, 'blink-automation.mjs');
 const terminalResultStatuses = new Set([

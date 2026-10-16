@@ -15,7 +15,7 @@ import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-const CLIENT_VERSION = '1.9.3';
+const CLIENT_VERSION = '1.9.6';
 const SKILL_ID = 'backlink-submit';
 const MAX_RELEASE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_HISTORY_LIMIT = 3;

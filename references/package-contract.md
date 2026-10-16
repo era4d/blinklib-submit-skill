@@ -60,7 +60,7 @@ Blink writes `connection.json` at download time with:
   "schemaVersion": 1,
   "appUrl": "https://blink.example",
   "apiKey": "<scoped-install-token>",
-  "clientVersion": "1.9.3"
+  "clientVersion": "1.9.6"
 }
 ```
 

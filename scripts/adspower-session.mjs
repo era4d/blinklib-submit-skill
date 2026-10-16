@@ -4,7 +4,7 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 
-const CLIENT_VERSION = '1.9.3';
+const CLIENT_VERSION = '1.9.6';
 const DEFAULT_API_BASE = 'http://127.0.0.1:50325';
 const REQUEST_TIMEOUT_MS = 30_000;
 const LIFECYCLE_INTERVAL_MS = 1_100;

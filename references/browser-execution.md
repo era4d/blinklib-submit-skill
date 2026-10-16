@@ -1,6 +1,6 @@
 # Browser execution workflow
 
-For new browser work, reuse already connected Remote Chrome; otherwise use the built-in browser described in [platform-adapters.md](platform-adapters.md#browser-selection-order). Do not request a new debugging setup when the built-in fallback is available. Use the [Python runner](python-runner.md) only when it is already the selected backend.
+For new browser work, use **Tabbit → built-in browser** as described in [platform-adapters.md](platform-adapters.md#browser-selection-order). Read the installed `tabbit` skill first; if unavailable, use the built-in browser directly. Remote Chrome is not an automatic fallback. Keep existing work in its selected browser. Use the Chrome-specific procedures below and the [Python runner](python-runner.md) only for an explicitly requested Chrome backend or existing Chrome work.
 
 ## Preflight
 
