@@ -196,7 +196,7 @@ curl -sS -X POST "$BLINK_APP_URL/api/backlink-automation/resume" \
   --data '{ "runId": "RUN_ID" }'
 ```
 
-`reason` is either `awaiting_user_login` or `blocked_user_action`.
+`reason` is `awaiting_confirmation`, `awaiting_user_login`, or `blocked_user_action`. Use `awaiting_confirmation` with `resumePhase: "confirmation"` when an opened browser tab is retained for a real user decision. Automatic tasks require `runtime_confirmation_required` and its actual browser-tool evidence; legacy assisted tasks may use `assisted_final_review`. The task and log receive a distinct `awaiting_confirmation` status, the work lease is released, and the original tab alias/current URL are saved. Do not use `retry` for these forms; after the user's decision, `resume` returns an explicit `resume` object to reuse the same browser tab/session. Ordinary automatic steps remain authorized. Older `blocked_user_action` + `confirmation` callers are normalized on write and historical rows remain recognized on read.
 `blockerCode` is required by client 1.7.27. Supported blockers are
 `captcha`, `login_required`, `email_verification`,
 `missing_required_fact`, `asset_missing`, `asset_rejected`,
@@ -260,7 +260,7 @@ curl -sS -X POST "$BLINK_APP_URL/api/backlink-automation/claim/reject" \
 node "<SKILL_DIR>/scripts/blink-automation.mjs" version
 ```
 
-This is a local check and does not print the API key. The current downloadable client is `1.9.7`. `minimumClientVersion` is a compatibility baseline and does not stop historical clients. `recommendedClientVersion` reports the latest API package; version 1.9.1 and newer synchronize from the configured API or Git source before a new run starts. `configuredClientVersion` is installation metadata and does not override the actual script version.
+This is a local check and does not print the API key. The current downloadable client is `1.11.0`. `minimumClientVersion` is a compatibility baseline and does not stop historical clients. `recommendedClientVersion` reports the latest API package; version 1.9.1 and newer synchronize from the configured API or Git source before a new run starts. `configuredClientVersion` is installation metadata and does not override the actual script version.
 
 The version manager uses the installation's existing credential:
 
@@ -268,10 +268,10 @@ The version manager uses the installation's existing credential:
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" check
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" versions
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" update
-node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" update --version 1.9.7
+node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" update --version 1.11.0
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" git-check
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" git-update
-node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" git-update --ref v1.9.7
+node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" git-update --ref v1.11.0
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" update --source api
 node "<SKILL_DIR>/scripts/blink-skill-manager.mjs" rollback
 ```
@@ -474,7 +474,7 @@ claiming another task. `log --answers-file` is task history, not reusable memory
 
 ## Claim or retrieve the next item
 
-When `capabilities.batchPreparation` is true, each queue also returns `pendingConfirmationCount`, `preparationRemainingCount` and `pendingConfirmationTasks` (run ID, site, submission URL and opaque browser-tab alias). A filled semi-automatic form can be parked with `defer --reason blocked_user_action --resume-phase confirmation`, freeing the work lease for the next item. Prepared forms reserve the remaining daily target but are not accepted submissions. Once preparation finishes, review the retained tabs with the user and `resume --run-id` only the specifically approved tasks. Do not reset prepared forms through `retry`.
+When `capabilities.batchPreparation` is true, each queue also returns `pendingConfirmationCount`, `preparationRemainingCount` and `pendingConfirmationTasks` (run ID, `awaiting_confirmation` status, site, submission/current URLs and opaque browser-tab alias). An opened form awaiting a real user decision can be parked with `defer --reason awaiting_confirmation --resume-phase confirmation`, freeing the work lease for the next item. These forms reserve the remaining daily target but are not accepted submissions. Once preparation finishes, review the retained tabs with the user and `resume --run-id` only the specifically approved tasks. Do not reset prepared forms through `retry`.
 
 ```text
 node "<SKILL_DIR>/scripts/blink-automation.mjs" next
@@ -575,7 +575,7 @@ If `upload_file` rejects a project directory, use the installed runtime's docume
     "code": "SKILL_UPDATE_RECOMMENDED",
     "required": false,
     "installedVersion": "1.7.28",
-    "recommendedVersion": "1.9.7",
+    "recommendedVersion": "1.11.0",
     "remindWhen": "campaign_finished",
     "message": "..."
   }
@@ -590,3 +590,48 @@ The notice never blocks queue, claim, resume, project hydration, event, or resul
 Every automation request includes an `x-blink-request-id` for admin correlation. The server records Skill/API receipts, including authentication failures and failures before a task is claimed. Diagnostics contain only endpoint paths, bounded identifiers, response codes, and timing; never authorization headers, form answers, or raw request bodies.
 
 Transport timeouts, non-JSON responses and structured API errors are queued locally as sanitized diagnostic receipts (maximum 100). After a successful command, the client delivers up to ten receipts to `POST /api/backlink-automation/diagnostics`. Reports older than 30 days expire. The server deduplicates fallback API-error reports against an existing server failure receipt. Diagnostic delivery never retries the original submission and cannot settle a run. A server receipt can confirm a commit even if the client lost its response; reconcile that task before retrying. Older clients still receive server-side request auditing, but only 1.9.4+ clients provide offline/lost-response reports.
+
+## Description synthesis (1.9.5)
+
+Product descriptions and crawled website text are source evidence, not ready-to-submit answers. The form planner leaves description fields for composition unless a valid prepared or confirmed answer exists. Copied descriptions on historical runs are sent back through answer generation; a failed AI request never restores a raw-source fallback. The server validates cached answers and new answers against source copying, including short English/Chinese descriptions and passages joined with changed formatting. Identity facts such as product names and URLs remain reusable.
+
+## Performance and worker control (1.11.0)
+
+`queue` advertises `capabilities.performanceMetrics`. The file controller uses up to three workers, batch claims and per-task heartbeats. `next-batch` also returns authoritative settlements for slots without a claim. `status` exposes `revision`, `pendingRequests`, `activeLeases` and per-worker deliveries; `pendingRequest`/`activeLease` remain compatibility views. Already delivered requests are hidden from actionable requests and appear in `processingRequestIds` until consumed, so receipt delivery never means repeat the browser action.
+
+Use `status --after-revision REVISION --wait-ms 20000` to wait for changes, and pass a receipt array to `respond --receipt-file PATH` to deliver independent results together. `start --concurrency 1` selects serial work. After the user approves specific held tasks, pass their `--resume-run-id RUN_ID` flags to `start` and reconnect with the same scope. Never automatically resume unapproved tabs.
+
+`performance --run-id ID --lease-id ID --event-id ID --settlement-event-id ID --metrics-file PATH` records version-1 numeric-only phase/cache metrics through `POST /api/backlink-automation/performance`. The referenced original settlement event must match this owner, run and lease. This command cannot change a task status or count a submission. It is delivered through the durable outbox after settlement; generic logs cannot impersonate its event.
+
+`GET /api/backlink-automation/performance?queueId=ID` accepts the owned browser session or API key and returns the last seven days' timings, P50/P95, active-time throughput, human wait for resumed attempts and cache reuse. At most 2,000 metric records are sampled and truncation is explicit. No form values, URLs, file paths, cookies or credentials are included in metrics.
+
+Observed outcomes adjust eligible-resource ranking after at least three settled attempts. Ordered mode preserves curated order. Repeated login, paid-only or unavailable outcomes delay only owned queued tasks using `availableAt`. A cooldown-only settlement returns `nextAction: "cooldown_wait"` and `nextAvailableAt`; the controller finishes instead of polling until that time. The user can run it again later. No recurring schedule is created.
+
+## Shared SOP knowledge (1.11.0)
+
+`queue.capabilities.cloudSops` advertises the protocol; the authoritative per-task
+switch is `task.sopKnowledge.enabled`. Claims include up to three compatible
+candidate/verified templates without an extra lookup. Missing migrations or a
+knowledge-store outage disable that optional enrichment while normal submissions
+continue. Skill code releases and SOP versions have separate lifecycles.
+
+`POST /api/backlink-automation/sops` requires API-key auth and strict bounded JSON:
+`runId`, `leaseId`, `eventId`, `settlementEventId`, `skillVersion`, optional
+`template`, optional `feedback` and optional `skippedReason`. See
+[cloud-sops.md](cloud-sops.md). The server validates the original owned settled
+event and exact scope. Only evidenced accepted submissions create templates.
+Feedback requires a version actually issued with that lease. Each attempt is
+deduplicated independently of the event ID; generic logs cannot impersonate a
+contribution. The existing durable outbox and event lookup repair lost responses.
+
+Session-authenticated administrators with `admin.settings.read` can inspect the
+latest 50 versions through `GET /api/admin/submission-sops`, optionally filtering
+by `resourceKey`. `POST` with `{versionId, enabled}` requires
+`admin.settings.write` and disables/re-enables an immutable version. Re-enabling
+does not fabricate successful votes or force verified status. Disabling a bad
+version allows compatible older candidates to be selected.
+
+The release requires the reviewed `drizzle/0017_submission_sops.sql` migration.
+It creates only three new tables and indexes. Review it before applying it to
+production, then deploy the server and distribute/publish Skill 1.11.0. Keep
+historical Skill clients compatible; they do not provide a complete SOP trace.

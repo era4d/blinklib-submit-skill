@@ -4,7 +4,7 @@ import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { auditLog, auditResult, auditTask, RESULT_STATUSES } from './blink-audit.mjs';
 
-const CLIENT_VERSION = '1.9.7';
+const CLIENT_VERSION = '1.11.0';
 // Older clients may have cached raw profile images instead of API-resolved assets.
 const PRODUCT_CACHE_VERSION = 3;
 
@@ -630,6 +630,8 @@ async function postEvent(path, payload) {
       const event = lookup?.event;
       const matches = lookup?.found === true && event?.eventId === payload.eventId && event?.runId === payload.runId && event?.leaseId === payload.leaseId
         && (path.endsWith('/claim/reject') ? event.event === 'claim_rejected'
+          : path.endsWith('/performance') ? event.event === 'task_performance'
+          : path.endsWith('/sops') ? event.event === 'sop_contribution'
           : [payload.event, ...(path.endsWith('/lease/release') ? ['worker_released'] : []), ...(isResult ? ['submission_reconciled'] : [])].includes(event.event)
             && (!payload.status || event.status === payload.status));
       if (matches) {
@@ -687,6 +689,7 @@ async function rejectClaim(task, errorCode, context = {}) {
 }
 
 async function prepareClaim(task) {
+  const preparationStarted = performance.now();
   if (task === null) return null;
   const leaseId = task?.lease?.leaseId || task?.leaseId;
   if (!task || typeof task !== 'object' || Array.isArray(task) || typeof task.runId !== 'string' || !task.runId.trim() || typeof leaseId !== 'string' || !leaseId.trim()) {
@@ -714,7 +717,7 @@ async function prepareClaim(task) {
     });
   }
   if (!clientAudit.valid) return rejectClaim(task, 'CLIENT_TASK_AUDIT_FAILED', { clientAudit });
-  return { ...hydrated.task, clientAudit };
+  return { ...hydrated.task, productCache: { ...hydrated.task.productCache, scope: connectionCacheKey(), preparationMs: Math.round(performance.now() - preparationStarted) }, clientAudit };
 }
 
 // Flush only receipts from a previous invocation, after this command completes.
@@ -952,16 +955,19 @@ switch (command) {
     break;
   }
   case 'next': {
+    const claimStarted = performance.now();
     const queueSuffix = argument('queue-id') ? `&queueId=${encodeURIComponent(required('queue-id'))}` : '';
     result = await request(`/api/backlink-automation/next?includeProduct=false${queueSuffix}`, {
       method: 'POST',
     });
     if (!(result?.claim === null && result?.settlement)) {
       result = await prepareClaim(result);
+      if (result?.productCache) result.productCache.preparationMs = Math.round(performance.now() - claimStarted);
     }
     break;
   }
   case 'next-batch': {
+    const claimStarted = performance.now();
     let queueIds;
     try {
       queueIds = JSON.parse(required('queue-ids-json'));
@@ -986,8 +992,28 @@ switch (command) {
     }
     result = {
       claims,
+      ...(response?.settlements ? { settlements: response.settlements } : {}),
       ...(response?.skillUpdate ? { skillUpdate: response.skillUpdate } : {}),
     };
+    const preparationMs = Math.round(performance.now() - claimStarted);
+    for (const claim of claims) if (claim?.productCache) claim.productCache.preparationMs = preparationMs;
+    break;
+  }
+  case 'sop': {
+    const contribution = await jsonFile('sop-file');
+    result = await postEvent('/api/backlink-automation/sops', {
+      ...contribution,
+      runId: required('run-id'), leaseId: required('lease-id'),
+      eventId: argument('event-id') || randomUUID(), settlementEventId: required('settlement-event-id'),
+    });
+    break;
+  }
+  case 'performance': {
+    result = await postEvent('/api/backlink-automation/performance', {
+      runId: required('run-id'), leaseId: required('lease-id'),
+      eventId: argument('event-id') || randomUUID(), settlementEventId: required('settlement-event-id'),
+      performance: await jsonFile('metrics-file'),
+    });
     break;
   }
   case 'set-concurrency': {
@@ -1053,8 +1079,8 @@ switch (command) {
   }
   case 'defer': {
     const reason = required('reason');
-    if (!['awaiting_user_login', 'blocked_user_action'].includes(reason)) {
-      throw new Error('defer --reason must be awaiting_user_login or blocked_user_action.');
+    if (!['awaiting_confirmation', 'awaiting_user_login', 'blocked_user_action'].includes(reason)) {
+      throw new Error('defer --reason must be awaiting_confirmation, awaiting_user_login or blocked_user_action.');
     }
     const payload = compactPayload({
         runId: required('run-id'),
@@ -1074,11 +1100,13 @@ switch (command) {
     break;
   }
   case 'resume': {
+    const claimStarted = performance.now();
     result = await request('/api/backlink-automation/resume?includeProduct=false', {
       method: 'POST',
       body: JSON.stringify({ runId: required('run-id') }),
     });
     result = await prepareClaim(result);
+    if (result?.productCache) result.productCache.preparationMs = Math.round(performance.now() - claimStarted);
     break;
   }
   case 'release': {

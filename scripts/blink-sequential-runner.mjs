@@ -9,16 +9,29 @@ import { fileURLToPath } from 'node:url';
 
 import { auditResult } from './blink-audit.mjs';
 import {
+  createSopCapture,
+  matchCloudSop,
+  sopTracePolicy,
+} from './blink-cloud-sop.mjs';
+import {
+  needsProseRewrite,
   planFormFields,
   validateFormExecutionReceipts,
 } from './blink-form-plan.mjs';
+import {
+  assetCacheKey,
+  controlIdentity,
+  createOptimizationStore,
+  createTaskMetrics,
+} from './blink-optimization.mjs';
+import { runConcurrentCampaign } from './blink-runner-scheduler.mjs';
 import {
   createFileTransport,
   runTransportCommand,
 } from './blink-runner-transport.mjs';
 import { synchronizeInstalledSkill } from './blink-skill-manager.mjs';
 
-const CLIENT_VERSION = '1.9.7';
+const CLIENT_VERSION = '1.11.0';
 const here = dirname(fileURLToPath(import.meta.url));
 const client = resolve(here, 'blink-automation.mjs');
 const terminalResultStatuses = new Set([
@@ -54,7 +67,7 @@ const groundedNarrativeReasons = new Set([
 const factualIdentityField =
   /\b(?:name|email|e-mail|url|website|link|phone|address|username|user name|handle|twitter|linkedin|facebook|instagram|github|founder|founded|year|date|price|pricing|revenue|employees?|country|city|legal|vat|tax|registration|domain)\b|名称|姓名|邮箱|网址|链接|电话|地址|用户名|账号|创始人|成立|年份|日期|价格|定价|收入|员工|国家|城市|法律|税号|注册|域名/i;
 const narrativeQuestion =
-  /\b(?:describe|explain|tell|share|why|how|strategy|strategies|plan|plans|future|roadmap|tech stack|technology|use case|problem|solution|benefit|advantage|differentiat|mission|story|goal|audience|feature|workflow|launch|motivation)\b|描述|介绍|为什么|如何|策略|计划|规划|技术栈|技术|使用场景|问题|解决方案|优势|愿景|故事|目标|用户|功能|工作流|发布|动机/i;
+  /\b(?:describe|description|summary|overview|about|explain|tell|share|why|how|strategy|strategies|plan|plans|future|roadmap|tech stack|technology|use case|problem|solution|benefit|advantage|differentiat|mission|story|goal|audience|feature|workflow|launch|motivation)\b|描述|介绍|为什么|如何|策略|计划|规划|技术栈|技术|使用场景|问题|解决方案|优势|愿景|故事|目标|用户|功能|工作流|发布|动机/i;
 const googleLoginPolicy = Object.freeze({
   preferredProvider: 'google',
   attemptBeforeDeferral: true,
@@ -79,6 +92,7 @@ const browserInteractionPolicy = Object.freeze({
   userPrompts: 'preserved_progress_tabs_at_batch_end_only',
   onBlocker: 'defer_and_continue',
   onBlockerBeforeFormProgress: 'close_and_continue',
+  onConfirmationRequired: 'preserve_and_report_awaiting_confirmation',
   onBlockerAfterFormProgress: 'preserve_and_continue',
   onFailedLoginBeforeFormProgress: 'close_and_continue',
   onFailedLoginAfterFormProgress: 'preserve_and_continue',
@@ -166,15 +180,20 @@ export async function prepareTaskAnswers(io, task) {
   const values = { ...task.fieldAnswers };
   const pending = [];
   for (const field of fields) {
+    // Old runs may contain the profile/crawl copy that earlier clients treated
+    // as a completed description. Never keep it as a fallback if AI fails.
+    if (needsProseRewrite(field, values[field.key], task.product))
+      delete values[field.key];
     const kind = ['email', 'url', 'number'].includes(field.type)
       ? field.type
       : ['select', 'radio', 'checkbox', 'multi_select'].includes(field.type)
         ? field.type
         : 'text';
-    const plan = planFormFields(task, [
+    const plan = planFormFields({ ...task, fieldAnswers: values }, [
       {
         ref: field.key,
         label: field.label,
+        type: field.type,
         kind,
         maxLength: field.maxLength,
         required: field.required,
@@ -189,12 +208,12 @@ export async function prepareTaskAnswers(io, task) {
   let preparation = {
     status: 'ready',
     questionCount: fields.length,
-    reusedAnswerCount: fields.filter((field) => String(values[field.key] ?? '').trim()).length,
+    reusedAnswerCount: fields.filter((field) =>
+      String(values[field.key] ?? '').trim()
+    ).length,
     requestedCount: pending.length,
   };
-  if (
-    pending.length && task.aiGeneration?.available === false
-  ) {
+  if (pending.length && task.aiGeneration?.available === false) {
     preparation.status = 'credits_unavailable';
   } else if (
     pending.length &&
@@ -256,6 +275,8 @@ export function groundedAnswerContext(task, plan) {
     productContext: task.product || {},
     groundedAnswerPolicy: {
       mode: 'compose_open_ended_from_product_context',
+      sourceTextPolicy:
+        'Extract relevant product facts, then summarize in fresh wording. Never paste or concatenate crawled prose, navigation, contact details, or source labels into an answer.',
       composableFields,
       preserveKnownAnswers: true,
       optionalUnknownFacts: 'leave_blank',
@@ -282,10 +303,24 @@ function validFormProgress(progress) {
   );
 }
 
+export function isConfirmationBlocker(receipt) {
+  return (
+    receipt?.type === 'blocker' &&
+    ['runtime_confirmation_required', 'assisted_final_review'].includes(
+      receipt.blockerCode
+    )
+  );
+}
+
 export function blockerTabDispositionError(receipt, priorReceipts = []) {
   if (receipt?.type !== 'blocker') return null;
   if (!validFormProgress(receipt.formProgress)) {
     return 'A blocker receipt must report formProgress with non-negative integer filledFieldCount and acceptedUploadCount plus boolean advancedStep. Inspect the existing tab; do not close it until progress is classified.';
+  }
+  if (isConfirmationBlocker(receipt)) {
+    return receipt.tabDisposition === 'preserved'
+      ? null
+      : 'Keep the opened task tab available while awaiting user confirmation and return tabDisposition "preserved", even before the first field is filled.';
   }
   const hasPriorAppliedField = priorReceipts.some(
     (entry) => entry?.status === 'applied'
@@ -357,18 +392,28 @@ export async function stageTaskUploads(io, task, controls, cache = new Map()) {
     ]
       .filter(([, pattern]) => pattern.test(label))
       .map(([purpose]) => purpose);
-    if (purposes.length !== 1) continue;
-    const purpose = purposes[0];
+    const learnedPurpose = io.recipe?.uploads?.find(
+      (upload) => upload.identity === controlIdentity(control)
+    )?.purpose;
+    const purpose =
+      purposes.length === 1
+        ? purposes[0]
+        : purposes.length === 0
+          ? learnedPurpose
+          : null;
+    if (!['logo', 'preview', 'screenshots'].includes(purpose)) continue;
     if (!cache.has(purpose)) {
       try {
         // No output override: the client downloads to os.tmpdir()/blink-upload-*.
-        const assets = await io.cli([
-          'assets',
-          '--project-id',
-          task.projectId,
-          '--download',
-          purpose,
-        ]);
+        const assets = io.fetchAssets
+          ? await io.fetchAssets(purpose)
+          : await io.cli([
+              'assets',
+              '--project-id',
+              task.projectId,
+              '--download',
+              purpose,
+            ]);
         cache.set(purpose, {
           status: assets.files?.length ? 'staged' : 'missing_asset',
           files: assets.files || [],
@@ -378,7 +423,7 @@ export async function stageTaskUploads(io, task, controls, cache = new Map()) {
         cache.set(purpose, { status: 'download_failed', files: [] });
       }
     }
-    const staged = cache.get(purpose);
+    const staged = await cache.get(purpose);
     uploads.push({
       ref: control.ref,
       label: control.label,
@@ -555,6 +600,16 @@ function runtimeEvidenceValid(blockerCode, evidence) {
 }
 
 export async function runSequentialSession(io, options = {}) {
+  if (
+    io.concurrentRequests &&
+    (options.concurrency !== 1 || options.resumeRunIds?.length)
+  ) {
+    return runConcurrentCampaign(
+      io,
+      (task, blocked) => processTask(io, task, blocked, options),
+      options
+    );
+  }
   const requestedQueueIds = options.queueIds ?? [];
   const blocked = [];
   let cursor = 0;
@@ -562,6 +617,7 @@ export async function runSequentialSession(io, options = {}) {
 
   async function claimNext() {
     const summary = await io.cli(['queue']);
+    io.performanceReporting = summary.capabilities?.performanceMetrics === true;
     const queueIds = parseQueueIds(summary, requestedQueueIds);
     const settlements = [];
     for (let attempt = 0; attempt < queueIds.length; attempt += 1) {
@@ -607,6 +663,7 @@ export async function runSequentialSession(io, options = {}) {
         'batch_handoff',
         'campaign_complete',
         'queue_stopped',
+        'cooldown_wait',
       ]);
       const allSettled =
         settlements.length > 0 &&
@@ -627,7 +684,8 @@ export async function runSequentialSession(io, options = {}) {
         const skillUpdate =
           claimed.summary?.skillUpdate ||
           queues.find((queue) => queue?.skillUpdate)?.skillUpdate ||
-          settlements.find((settlement) => settlement?.skillUpdate)?.skillUpdate ||
+          settlements.find((settlement) => settlement?.skillUpdate)
+            ?.skillUpdate ||
           null;
         return io.emit({
           type: 'campaign_finished',
@@ -687,349 +745,523 @@ export async function runSequentialSession(io, options = {}) {
       continue;
     }
 
-    let task = claimed.task;
     claimedCount += 1;
-    const stopHeartbeat = io.startHeartbeat(task);
-    let plan;
-    let receipts = [];
-    const appliedProgressReceipts = new Map();
-    let observedControls = [];
-    let currentUrl = task.submissionUrl;
-    let tabId;
-    const stagedAssets = new Map();
-    try {
-      await io.emit({ type: 'task_preparing', runId: task.runId, continueRequired: true });
-      task = await prepareTaskAnswers(io, task);
-      const browserTask = {
-        ...task,
-        browser: {
-          ...task.browser,
-          preserveAfterSubmission: false,
-          preserveAfterAnyFormProgress: true,
-          preserveEveryProgressedTab: true,
-        },
+    await processTask(io, claimed.task, blocked, options);
+  }
+}
+
+async function processTask(io, originalTask, blocked, options = {}) {
+  let task = originalTask;
+  const stopHeartbeat = io.startHeartbeat(task);
+  let plan;
+  let receipts = [];
+  const appliedProgressReceipts = new Map();
+  let observedControls = [];
+  let observedLanguage;
+  let currentUrl = task.submissionUrl;
+  let tabId;
+  const stagedAssets = new Map();
+  const metrics = createTaskMetrics(task, options.monotonicNow);
+  const observations = [];
+  const sopCapture = createSopCapture(task);
+  let cloudFeedback;
+  let outcomeStatus = 'submission_failed',
+    outcomeBlocker;
+  let recordedPerformance;
+  const store = await (io.optimizationStore?.(task) ||
+    createOptimizationStore());
+  const getAssets = async (purpose) => {
+    metrics.cache.assetLookups += 1;
+    const cached = await store.assets(task, purpose);
+    if (cached) {
+      metrics.cache.assetHits += 1;
+      return cached;
+    }
+    const key = assetCacheKey(task, purpose);
+    const work = async () => {
+      const result = await io.cli([
+        'assets',
+        '--project-id',
+        task.projectId,
+        '--download',
+        purpose,
+      ]);
+      await store.saveAssets(task, purpose, result).catch(() => {});
+      return result;
+    };
+    if (io.sharedAssets && key) {
+      const scoped = `${task.productCache?.scope || task.projectId}:${key}`;
+      if (io.sharedAssets.has(scoped)) {
+        metrics.cache.assetHits += 1;
+        return io.sharedAssets.get(scoped);
+      }
+      const promise = work().finally(() => {
+        io.sharedAssets.delete(scoped);
+      });
+      io.sharedAssets.set(scoped, promise);
+      return promise;
+    }
+    return work();
+  };
+  const assetIo = { ...io, fetchAssets: getAssets };
+  const makePlan = (controls) => {
+    metrics.cache.recipeLookups += 1;
+    const cloud = matchCloudSop(task, controls, observedLanguage);
+    const recipe =
+      cloud?.status === 'verified'
+        ? cloud.recipe
+        : store.recipe(task, controls);
+    if (recipe) metrics.cache.recipeHits += 1;
+    const prepared = planFormFields(task, controls, {
+      platformDomain: task.platformDomain,
+      recipe,
+    });
+    if (
+      cloud?.status === 'verified' &&
+      !task.resume?.reuseExistingTab &&
+      (!cloudFeedback || cloudFeedback.match === 'matched') &&
+      prepared.fields.some((field) =>
+        cloud.recipe.fields.some(
+          (mapping) =>
+            mapping.source === field.source &&
+            mapping.identity ===
+              controlIdentity(
+                controls.find((control) => control.ref === field.ref) || {}
+              )
+        )
+      )
+    ) {
+      cloudFeedback = { versionId: cloud.versionId, match: 'matched' };
+    }
+    return prepared;
+  };
+  const measureRequest = (request, validate) =>
+    metrics.measure(
+      request.action === 'open_and_inspect' || request.action === 'reinspect'
+        ? 'inspection'
+        : 'filling_upload',
+      () => requestReceipt(io, request, validate)
+    );
+  const report = async (settlementEventId) => {
+    const performance = metrics.snapshot();
+    recordedPerformance = performance;
+    if (io.performanceReporting) {
+      const args = [
+        'performance',
+        '--run-id',
+        task.runId,
+        '--lease-id',
+        task.lease.leaseId,
+        '--event-id',
+        randomUUID(),
+        '--settlement-event-id',
+        settlementEventId,
+        '--metrics-file',
+        await io.jsonFile('task-performance', performance),
+      ];
+      if (io.queueDelivery) await io.queueDelivery(args);
+      else await io.cli(args).catch(() => {});
+    }
+    return performance;
+  };
+  const reportSop = async (settlementEventId, decision) => {
+    if (task.sopKnowledge?.enabled !== true) return;
+    const feedback = decision.sopFeedback;
+    if (
+      !task.resume?.reuseExistingTab &&
+      feedback &&
+      task.sopKnowledge.candidates.some(
+        (candidate) => candidate.versionId === feedback.versionId
+      ) &&
+      ['matched', 'structure_mismatch', 'binding_mismatch'].includes(
+        feedback.match
+      ) &&
+      (feedback.failedStep === undefined ||
+        (Number.isInteger(feedback.failedStep) &&
+          feedback.failedStep >= 0 &&
+          feedback.failedStep < 12))
+    ) {
+      cloudFeedback = {
+        versionId: feedback.versionId,
+        match: feedback.match,
+        ...(feedback.failedStep === undefined
+          ? {}
+          : { failedStep: feedback.failedStep }),
       };
+    }
+    const captured = sopCapture.finish(decision);
+    const args = [
+      'sop',
+      '--run-id',
+      task.runId,
+      '--lease-id',
+      task.lease.leaseId,
+      '--event-id',
+      randomUUID(),
+      '--settlement-event-id',
+      settlementEventId,
+      '--sop-file',
+      await io.jsonFile('sop-contribution', {
+        skillVersion: CLIENT_VERSION,
+        ...captured,
+        ...(cloudFeedback ? { feedback: cloudFeedback } : {}),
+      }),
+    ];
+    try {
+      if (io.queueDelivery) await io.queueDelivery(args);
+      else await io.cli(args);
+    } catch {
+      // A knowledge delivery failure cannot replay an accepted site submission.
       await io.emit({
-        type: 'task_prepared',
+        type: 'sop_delivery_pending',
         runId: task.runId,
-        productCache: task.productCache,
-        answerPreparation: task.answerPreparation,
         continueRequired: true,
       });
-      const progress = async (status, event) =>
-        io.cli([
-          'log',
-          '--run-id',
-          task.runId,
-          '--lease-id',
-          task.lease.leaseId,
-          '--event-id',
-          randomUUID(),
-          '--occurred-at',
-          new Date().toISOString(),
-          '--event',
-          event,
-          '--status',
-          status,
-          '--message-file',
-          await io.textFile(
-            'progress-message',
-            `Browser workflow entered ${status}.`
-          ),
-        ]);
-      await progress('inspecting', 'browser_opened');
-      const inspectRequestId = randomUUID();
-      const inspection = await requestReceipt(
-        io,
+    }
+  };
+  try {
+    await io.emit({
+      type: 'task_preparing',
+      runId: task.runId,
+      continueRequired: true,
+    });
+    task = await metrics.measure('preparation', async () => {
+      const cached = store.answers(task);
+      const fieldKeys = (task.resource?.submissionFields || []).map(
+        (field) => field.key
+      );
+      metrics.cache.answerLookups += fieldKeys.length;
+      const known = { ...task.fieldAnswers };
+      for (const [key, value] of Object.entries(cached || {}))
+        if (!String(known[key] ?? '').trim()) known[key] = value;
+      metrics.cache.answerHits += fieldKeys.filter((key) =>
+        String(known[key] ?? '').trim()
+      ).length;
+      return prepareTaskAnswers(io, { ...task, fieldAnswers: known });
+    });
+    // Start only uploads already described by the authoritative task. Browser
+    // discovery still selects and verifies the actual upload controls.
+    if (task.authorization?.assetUpload === true) {
+      for (const field of task.resource?.submissionFields || []) {
+        const purpose =
+          field.type === 'logo'
+            ? 'logo'
+            : field.type === 'preview'
+              ? 'preview'
+              : field.type === 'screenshot'
+                ? 'screenshots'
+                : null;
+        if (!purpose || stagedAssets.has(purpose)) continue;
+        const promise = getAssets(purpose)
+          .then((assets) => ({
+            status: assets.files?.length ? 'staged' : 'missing_asset',
+            files: assets.files || [],
+          }))
+          .catch(() => ({ status: 'download_failed', files: [] }));
+        stagedAssets.set(purpose, promise);
+      }
+    }
+    const browserTask = {
+      ...task,
+      browser: {
+        ...task.browser,
+        preserveAfterSubmission: false,
+        preserveAfterAnyFormProgress: true,
+        preserveEveryProgressedTab: true,
+      },
+    };
+    await io.emit({
+      type: 'task_prepared',
+      runId: task.runId,
+      productCache: task.productCache,
+      answerPreparation: task.answerPreparation,
+      continueRequired: true,
+    });
+    const progress = async (status, event) =>
+      io.cli([
+        'log',
+        '--run-id',
+        task.runId,
+        '--lease-id',
+        task.lease.leaseId,
+        '--event-id',
+        randomUUID(),
+        '--occurred-at',
+        new Date().toISOString(),
+        '--event',
+        event,
+        '--status',
+        status,
+        '--message-file',
+        await io.textFile(
+          'progress-message',
+          `Browser workflow entered ${status}.`
+        ),
+      ]);
+    await progress('inspecting', 'browser_opened');
+    const inspectRequestId = randomUUID();
+    const inspection = await measureRequest(
+      {
+        type: 'browser_action_required',
+        action: task.resume?.reuseExistingTab
+          ? 'reinspect'
+          : 'open_and_inspect',
+        ...(task.resume?.reuseExistingTab
+          ? {
+              tabId: task.resume.browserSessionAlias,
+              currentUrl: task.resume.currentUrl,
+            }
+          : {}),
+        requestId: inspectRequestId,
+        submissionUrl: task.submissionUrl,
+        task: browserTask,
+        loginPolicy: googleLoginPolicy,
+        interactionPolicy: browserInteractionPolicy,
+      },
+      inspectionError
+    );
+    currentUrl = inspection.currentUrl || currentUrl;
+    tabId = inspection.tabId;
+    observedControls = inspection.controls;
+    observedLanguage = inspection.language;
+    // Count a structural miss only for an explicitly observed matching locale.
+    // An unloaded/empty form or an auth interruption supplies no negative vote.
+    if (
+      !task.resume?.reuseExistingTab &&
+      inspection.language &&
+      observedControls.length &&
+      task.sopKnowledge?.candidates?.length &&
+      !matchCloudSop(task, observedControls, inspection.language)
+    ) {
+      const candidate = task.sopKnowledge.candidates.find(
+        (candidate) => candidate.template?.locale === inspection.language
+      );
+      if (candidate)
+        cloudFeedback = {
+          versionId: candidate.versionId,
+          match: 'structure_mismatch',
+          failedStep: 0,
+        };
+    }
+    plan = makePlan(inspection.controls);
+    // Once a browser mutation is possible, an expired lease must not be
+    // automatically requeued as an untouched task.
+    await progress('form_in_progress', 'form_started');
+
+    while (true) {
+      if (plan.requiredExecutions.length === 0) break;
+      const fillRequestId = randomUUID();
+      const fill = await measureRequest(
         {
           type: 'browser_action_required',
-          action: 'open_and_inspect',
-          requestId: inspectRequestId,
+          action: 'apply_form_plan',
+          requestId: fillRequestId,
+          runId: task.runId,
+          tabId,
           submissionUrl: task.submissionUrl,
-          task: browserTask,
+          currentUrl,
+          plan,
           loginPolicy: googleLoginPolicy,
           interactionPolicy: browserInteractionPolicy,
         },
-        inspectionError
+        (receipt) =>
+          receipt.type !== 'form_execution' ||
+          receipt.planId !== plan.planId ||
+          !Array.isArray(receipt.receipts)
+            ? 'Return type form_execution, the exact planId, and a receipts array for the fields already applied.'
+            : null
       );
-      currentUrl = inspection.currentUrl || currentUrl;
-      tabId = inspection.tabId;
-      observedControls = inspection.controls;
-      plan = planFormFields(task, inspection.controls, {
-        platformDomain: task.platformDomain,
-      });
-      // Once a browser mutation is possible, an expired lease must not be
-      // automatically requeued as an untouched task.
-      await progress('form_in_progress', 'form_started');
+      receipts = fill.receipts;
+      observations.push({ controls: observedControls, plan, receipts });
+      sopCapture.plan(observedControls, plan, receipts, fill.pageChanged);
+      for (const receipt of receipts) {
+        if (receipt?.status === 'applied') {
+          appliedProgressReceipts.set(
+            `${plan.planId}:${String(receipt.ref || '')}`,
+            receipt
+          );
+        }
+      }
+      const validation = validateFormExecutionReceipts(plan, receipts);
+      if (!validation.complete || fill.pageChanged) {
+        await io.emit({
+          type: 'receipt_rejected',
+          code: fill.pageChanged
+            ? 'PAGE_CHANGED_REINSPECTION_REQUIRED'
+            : 'INCOMPLETE_FORM_EXECUTION',
+          runId: task.runId,
+          planId: plan.planId,
+          pending: validation.pending,
+          rejected: validation.rejected,
+        });
+        if (fill.pageChanged) {
+          metrics.reinspect();
+          const reinspectionId = randomUUID();
+          const reinspection = await measureRequest(
+            {
+              type: 'browser_action_required',
+              action: 'reinspect',
+              requestId: reinspectionId,
+              runId: task.runId,
+              tabId,
+              submissionUrl: task.submissionUrl,
+              currentUrl: fill.currentUrl || currentUrl,
+              loginPolicy: googleLoginPolicy,
+              interactionPolicy: browserInteractionPolicy,
+            },
+            inspectionError
+          );
+          currentUrl = reinspection.currentUrl || currentUrl;
+          observedControls = reinspection.controls;
+          observedLanguage = reinspection.language || observedLanguage;
+          plan = makePlan(reinspection.controls);
+          receipts = [];
+        }
+        continue;
+      }
+      currentUrl = fill.currentUrl || currentUrl;
+      break;
+    }
 
+    resolutionLoop: while (true) {
+      const uploadRecipe = matchCloudSop(
+        task,
+        observedControls,
+        observedLanguage
+      );
+      const uploads = await stageTaskUploads(
+        {
+          ...assetIo,
+          recipe:
+            uploadRecipe?.status === 'verified'
+              ? uploadRecipe.recipe
+              : store.recipe(task, observedControls),
+        },
+        task,
+        observedControls,
+        stagedAssets
+      );
+      const answerContext = groundedAnswerContext(task, plan);
+      let decision;
       while (true) {
-        if (plan.requiredExecutions.length === 0) break;
-        const fillRequestId = randomUUID();
-        const fill = await requestReceipt(
-          io,
+        const decisionRequestId = randomUUID();
+        decision = await measureRequest(
           {
             type: 'browser_action_required',
-            action: 'apply_form_plan',
-            requestId: fillRequestId,
+            action: 'resolve_then_submit_or_block',
+            requestId: decisionRequestId,
             runId: task.runId,
             tabId,
             submissionUrl: task.submissionUrl,
             currentUrl,
-            plan,
+            unresolved: plan.unresolved,
+            fieldAnswers: task.fieldAnswers,
+            submissionFields: task.resource?.submissionFields || [],
+            answerPreparation: task.answerPreparation,
+            ...answerContext,
+            blockers: plan.blockers,
+            authorization: task.authorization,
+            projectId: task.projectId,
+            uploads,
+            uploadPolicy: {
+              mode: 'automatic_temp_staging',
+              sourcePaths: 'uploads[].files[].path',
+              attachBeforeOutcome: true,
+              browserAction: 'use_current_runtime_file_upload',
+              verification:
+                'selected_filename_thumbnail_or_completed_upload_state',
+              requireUploadReceipts: true,
+              nativeFilePicker: 'do_not_leave_open',
+            },
+            executionMode: task.executionMode,
             loginPolicy: googleLoginPolicy,
             interactionPolicy: browserInteractionPolicy,
+            knownFormProgress: {
+              filledFieldCount: appliedProgressReceipts.size,
+              acceptedUploadCount: 0,
+              advancedStep: false,
+            },
+            ...(task.sopKnowledge?.enabled
+              ? { sopTracePolicy, sopKnowledge: task.sopKnowledge }
+              : {}),
           },
           (receipt) =>
-            receipt.type !== 'form_execution' ||
-            receipt.planId !== plan.planId ||
-            !Array.isArray(receipt.receipts)
-              ? 'Return type form_execution, the exact planId, and a receipts array for the fields already applied.'
-              : null
+            outcomeError(receipt, task) ||
+            (task.sopKnowledge?.enabled &&
+            ['submitted', 'awaiting_approval', 'published'].includes(
+              receipt.status
+            ) &&
+            typeof receipt.workflowTrace?.complete !== 'boolean'
+              ? 'Return workflowTrace.complete with the observed remaining steps, or false if the trace is incomplete. Correct the receipt only; never repeat Submit.'
+              : null) ||
+            uploadCompletionError(receipt, uploads) ||
+            googleLoginBlockerError(receipt, [
+              ...appliedProgressReceipts.values(),
+            ]) ||
+            blockerTabDispositionError(receipt, [
+              ...appliedProgressReceipts.values(),
+            ])
         );
-        receipts = fill.receipts;
-        for (const receipt of receipts) {
-          if (receipt?.status === 'applied') {
-            appliedProgressReceipts.set(
-              `${plan.planId}:${String(receipt.ref || '')}`,
-              receipt
-            );
-          }
-        }
-        const validation = validateFormExecutionReceipts(plan, receipts);
-        if (!validation.complete || fill.pageChanged) {
+        if (
+          decision.type === 'blocker' &&
+          task.executionMode === 'automatic' &&
+          invalidAutomaticBlockers.has(decision.blockerCode)
+        ) {
           await io.emit({
             type: 'receipt_rejected',
-            code: fill.pageChanged
-              ? 'PAGE_CHANGED_REINSPECTION_REQUIRED'
-              : 'INCOMPLETE_FORM_EXECUTION',
+            code: 'INVALID_AUTOMATIC_BLOCKER',
             runId: task.runId,
-            planId: plan.planId,
-            pending: validation.pending,
-            rejected: validation.rejected,
+            nextAction: 'continue_automatic_submission',
           });
-          if (fill.pageChanged) {
-            const reinspectionId = randomUUID();
-            const reinspection = await requestReceipt(
-              io,
-              {
-                type: 'browser_action_required',
-                action: 'reinspect',
-                requestId: reinspectionId,
-                runId: task.runId,
-                tabId,
-                submissionUrl: task.submissionUrl,
-                currentUrl: fill.currentUrl || currentUrl,
-                loginPolicy: googleLoginPolicy,
-                interactionPolicy: browserInteractionPolicy,
-              },
-              inspectionError
-            );
-            currentUrl = reinspection.currentUrl || currentUrl;
-            observedControls = reinspection.controls;
-            plan = planFormFields(task, reinspection.controls, {
-              platformDomain: task.platformDomain,
-            });
-            receipts = [];
-          }
           continue;
         }
-        currentUrl = fill.currentUrl || currentUrl;
+        const groundedAnswerError = groundedAnswerBlockerError(
+          decision,
+          answerContext
+        );
+        if (groundedAnswerError) {
+          await io.emit({
+            type: 'receipt_rejected',
+            code: 'GROUNDED_ANSWER_REQUIRED',
+            runId: task.runId,
+            message: groundedAnswerError,
+            nextAction: 'compose_from_product_context_and_continue',
+          });
+          continue;
+        }
+        if (
+          decision.type === 'blocker' &&
+          !runtimeEvidenceValid(decision.blockerCode, decision.runtimeEvidence)
+        ) {
+          await io.emit({
+            type: 'receipt_rejected',
+            code: 'INVALID_RUNTIME_BLOCKER_EVIDENCE',
+            runId: task.runId,
+          });
+          continue;
+        }
         break;
       }
+      const formExecution = executionEvidence(
+        plan,
+        receipts,
+        observedControls,
+        decision?.pageChanged
+      );
 
-      resolutionLoop: while (true) {
-        const uploads = await stageTaskUploads(
-          io,
-          task,
-          observedControls,
-          stagedAssets
-        );
-        const answerContext = groundedAnswerContext(task, plan);
-        let decision;
-        while (true) {
-          const decisionRequestId = randomUUID();
-          decision = await requestReceipt(
-            io,
-            {
-              type: 'browser_action_required',
-              action: 'resolve_then_submit_or_block',
-              requestId: decisionRequestId,
-              runId: task.runId,
-              tabId,
-              submissionUrl: task.submissionUrl,
-              currentUrl,
-              unresolved: plan.unresolved,
-              fieldAnswers: task.fieldAnswers,
-              submissionFields: task.resource?.submissionFields || [],
-              answerPreparation: task.answerPreparation,
-              ...answerContext,
-              blockers: plan.blockers,
-              authorization: task.authorization,
-              projectId: task.projectId,
-              uploads,
-              uploadPolicy: {
-                mode: 'automatic_temp_staging',
-                sourcePaths: 'uploads[].files[].path',
-                attachBeforeOutcome: true,
-                browserAction: 'use_current_runtime_file_upload',
-                verification:
-                  'selected_filename_thumbnail_or_completed_upload_state',
-                requireUploadReceipts: true,
-                nativeFilePicker: 'do_not_leave_open',
-              },
-              executionMode: task.executionMode,
-              loginPolicy: googleLoginPolicy,
-              interactionPolicy: browserInteractionPolicy,
-              knownFormProgress: {
-                filledFieldCount: appliedProgressReceipts.size,
-                acceptedUploadCount: 0,
-                advancedStep: false,
-              },
-            },
-            (receipt) =>
-              outcomeError(receipt, task) ||
-              uploadCompletionError(receipt, uploads) ||
-              googleLoginBlockerError(
-                receipt,
-                [...appliedProgressReceipts.values()]
-              ) ||
-              blockerTabDispositionError(
-                receipt,
-                [...appliedProgressReceipts.values()]
-              )
-          );
-          if (
-            decision.type === 'blocker' &&
-            task.executionMode === 'automatic' &&
-            invalidAutomaticBlockers.has(decision.blockerCode)
-          ) {
-            await io.emit({
-              type: 'receipt_rejected',
-              code: 'INVALID_AUTOMATIC_BLOCKER',
-              runId: task.runId,
-              nextAction: 'continue_automatic_submission',
-            });
-            continue;
-          }
-          const groundedAnswerError = groundedAnswerBlockerError(
-            decision,
-            answerContext
-          );
-          if (groundedAnswerError) {
-            await io.emit({
-              type: 'receipt_rejected',
-              code: 'GROUNDED_ANSWER_REQUIRED',
-              runId: task.runId,
-              message: groundedAnswerError,
-              nextAction: 'compose_from_product_context_and_continue',
-            });
-            continue;
-          }
-          if (
-            decision.type === 'blocker' &&
-            !runtimeEvidenceValid(
-              decision.blockerCode,
-              decision.runtimeEvidence
-            )
-          ) {
-            await io.emit({
-              type: 'receipt_rejected',
-              code: 'INVALID_RUNTIME_BLOCKER_EVIDENCE',
-              runId: task.runId,
-            });
-            continue;
-          }
-          break;
-        }
-        const formExecution = executionEvidence(
-          plan,
-          receipts,
-          observedControls,
-          decision?.pageChanged
-        );
-
-        if (decision.type === 'blocker') {
-          const formFile = await io.jsonFile('form-execution', formExecution);
-          const runtimeFile = decision.runtimeEvidence
-            ? await io.jsonFile('runtime-evidence', decision.runtimeEvidence)
-            : null;
-          const args = [
-            'defer',
-            '--event-id',
-            randomUUID(),
-            '--occurred-at',
-            new Date().toISOString(),
-            '--run-id',
-            task.runId,
-            '--lease-id',
-            task.lease.leaseId,
-            '--reason',
-            decision.blockerCode === 'login_required'
-              ? 'awaiting_user_login'
-              : 'blocked_user_action',
-            '--blocker-code',
-            decision.blockerCode,
-            '--resume-phase',
-            decision.resumePhase || 'form',
-            '--idempotency-key',
-            task.idempotencyKey,
-            '--browser-session-alias',
-            String(tabId || `run-${task.runId}`),
-            '--current-url',
-            decision.currentUrl || currentUrl,
-            '--form-execution-file',
-            formFile,
-          ];
-          if (runtimeFile) args.push('--runtime-evidence-file', runtimeFile);
-          const settled = await io.cli(args);
-          if (settled?.settled === false) {
-            await io.emit({
-              type: 'receipt_rejected',
-              code: settled.code || 'DEFERRAL_REJECTED',
-              runId: task.runId,
-              nextAction: settled.nextAction || 'continue_automatic_submission',
-            });
-            continue resolutionLoop;
-          }
-          blocked.push({
-            runId: task.runId,
-            tabId,
-            blockerCode: decision.blockerCode,
-            currentUrl: decision.currentUrl || currentUrl,
-            formProgress: decision.formProgress,
-            tabDisposition: decision.tabDisposition,
-          });
-          const continueRequired =
-            settled?.settlement?.continueRequired ?? true;
-          await io.emit({
-            type: 'task_settled',
-            signal: continueRequired ? 'CONTINUE_REQUIRED' : 'SETTLED',
-            runId: task.runId,
-            outcome: 'deferred',
-            settlement: settled.settlement,
-            continueRequired,
-          });
-          break resolutionLoop;
-        }
-
-        if (
-          decision.type !== 'result' ||
-          !terminalResultStatuses.has(decision.status)
-        ) {
-          throw new Error('Expected a supported result or blocker receipt.');
-        }
-        const details = {
-          ...(decision.details || {}),
-          formExecution,
-          idempotencyKey: task.idempotencyKey,
-        };
-        const detailsFile = await io.jsonFile('result-details', details);
-        const messageFile = await io.textFile(
-          'result-message',
-          decision.message || `Recorded ${decision.status}.`
-        );
+      if (decision.type === 'blocker') {
+        const awaitingConfirmation = isConfirmationBlocker(decision);
+        const reason = awaitingConfirmation
+          ? 'awaiting_confirmation'
+          : decision.blockerCode === 'login_required'
+            ? 'awaiting_user_login'
+            : 'blocked_user_action';
+        const formFile = await io.jsonFile('form-execution', formExecution);
+        const runtimeFile = decision.runtimeEvidence
+          ? await io.jsonFile('runtime-evidence', decision.runtimeEvidence)
+          : null;
         const args = [
-          'result',
+          'defer',
           '--event-id',
           randomUUID(),
           '--occurred-at',
@@ -1038,92 +1270,193 @@ export async function runSequentialSession(io, options = {}) {
           task.runId,
           '--lease-id',
           task.lease.leaseId,
-          '--status',
-          decision.status,
-          '--message-file',
-          messageFile,
-          '--details-file',
-          detailsFile,
+          '--reason',
+          reason,
+          '--blocker-code',
+          decision.blockerCode,
+          '--resume-phase',
+          awaitingConfirmation
+            ? 'confirmation'
+            : decision.resumePhase || 'form',
           '--idempotency-key',
           task.idempotencyKey,
+          '--browser-session-alias',
+          String(tabId || `run-${task.runId}`),
+          '--current-url',
+          decision.currentUrl || currentUrl,
+          '--form-execution-file',
+          formFile,
         ];
-        if (decision.resultUrl) args.push('--result-url', decision.resultUrl);
-        // Delivery retries replay only the same Blink event, never the external Submit.
-        let settled;
-        for (let attempt = 0; ; attempt += 1) {
-          try {
-            settled = await io.cli(args);
-            break;
-          } catch (error) {
-            if (
-              attempt >= 2 ||
-              !/fetch failed|timeout|timed out|ECONNRESET|502|503|504/i.test(
-                error.message
-              )
-            )
-              throw error;
-            await io.emit({
-              type: 'delivery_retry',
-              runId: task.runId,
-              continueRequired: true,
-              message:
-                'Retrying the same saved Blink receipt; do not submit the website again.',
-            });
-            await io.wait(1_000 * (attempt + 1));
-          }
+        if (runtimeFile) args.push('--runtime-evidence-file', runtimeFile);
+        const settled = await metrics.measure('delivery', () => io.cli(args));
+        if (settled?.settled === false) {
+          await io.emit({
+            type: 'receipt_rejected',
+            code: settled.code || 'DEFERRAL_REJECTED',
+            runId: task.runId,
+            nextAction: settled.nextAction || 'continue_automatic_submission',
+          });
+          continue resolutionLoop;
         }
+        outcomeStatus = settled.status || reason;
+        outcomeBlocker = decision.blockerCode;
+        await stopHeartbeat();
+        const performance = await report(args[args.indexOf('--event-id') + 1]);
+        await reportSop(args[args.indexOf('--event-id') + 1], decision);
+        blocked.push({
+          runId: task.runId,
+          status: settled.status || reason,
+          tabId,
+          blockerCode: decision.blockerCode,
+          currentUrl: decision.currentUrl || currentUrl,
+          formProgress: decision.formProgress,
+          tabDisposition: decision.tabDisposition,
+        });
         const continueRequired = settled?.settlement?.continueRequired ?? true;
         await io.emit({
           type: 'task_settled',
           signal: continueRequired ? 'CONTINUE_REQUIRED' : 'SETTLED',
           runId: task.runId,
-          outcome: decision.status,
+          outcome: 'deferred',
+          performance,
+          status: settled.status || reason,
+          tabId,
+          tabDisposition: decision.tabDisposition,
           settlement: settled.settlement,
           continueRequired,
         });
         break resolutionLoop;
       }
-    } catch (error) {
-      // Stop renewing first. Cleanup bypasses a stop request, never lease ownership.
-      await stopHeartbeat().catch(() => {});
-      try {
-        const release = await io.cli(
-          [
-            'release',
-            '--run-id',
-            task.runId,
-            '--lease-id',
-            task.lease.leaseId,
-            '--event-id',
-            randomUUID(),
-            '--occurred-at',
-            new Date().toISOString(),
-          ],
-          { cleanup: true }
-        );
-        await io.emit({
-          type: 'worker_lease_released',
-          runId: task.runId,
-          release,
-        });
-      } catch (releaseError) {
-        await io.emit({
-          type: 'worker_release_pending',
-          runId: task.runId,
-          message:
-            'Lease cleanup could not be confirmed. Heartbeats stopped; server expiry will recover the slot.',
-        });
+
+      if (
+        decision.type !== 'result' ||
+        !terminalResultStatuses.has(decision.status)
+      ) {
+        throw new Error('Expected a supported result or blocker receipt.');
       }
-      throw error;
-    } finally {
+      const details = {
+        ...(decision.details || {}),
+        formExecution,
+        idempotencyKey: task.idempotencyKey,
+      };
+      const detailsFile = await io.jsonFile('result-details', details);
+      const messageFile = await io.textFile(
+        'result-message',
+        decision.message || `Recorded ${decision.status}.`
+      );
+      const args = [
+        'result',
+        '--event-id',
+        randomUUID(),
+        '--occurred-at',
+        new Date().toISOString(),
+        '--run-id',
+        task.runId,
+        '--lease-id',
+        task.lease.leaseId,
+        '--status',
+        decision.status,
+        '--message-file',
+        messageFile,
+        '--details-file',
+        detailsFile,
+        '--idempotency-key',
+        task.idempotencyKey,
+      ];
+      if (decision.resultUrl) args.push('--result-url', decision.resultUrl);
+      // Delivery retries replay only the same Blink event, never the external Submit.
+      let settled;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          settled = await metrics.measure('delivery', () => io.cli(args));
+          break;
+        } catch (error) {
+          if (
+            attempt >= 2 ||
+            !/fetch failed|timeout|timed out|ECONNRESET|502|503|504/i.test(
+              error.message
+            )
+          )
+            throw error;
+          await io.emit({
+            type: 'delivery_retry',
+            runId: task.runId,
+            continueRequired: true,
+            message:
+              'Retrying the same saved Blink receipt; do not submit the website again.',
+          });
+          await io.wait(1_000 * (attempt + 1));
+        }
+      }
+      outcomeStatus = decision.status;
       await stopHeartbeat();
+      observations.push({
+        controls: observedControls,
+        plan,
+        receipts,
+        uploads,
+        uploadReceipts: decision.uploadReceipts || [],
+      });
+      await store.learn(task, observations, decision.status).catch(() => {});
+      const performance = await report(args[args.indexOf('--event-id') + 1]);
+      await reportSop(args[args.indexOf('--event-id') + 1], decision);
+      const continueRequired = settled?.settlement?.continueRequired ?? true;
+      await io.emit({
+        type: 'task_settled',
+        signal: continueRequired ? 'CONTINUE_REQUIRED' : 'SETTLED',
+        runId: task.runId,
+        outcome: decision.status,
+        performance,
+        settlement: settled.settlement,
+        continueRequired,
+      });
+      break resolutionLoop;
     }
+  } catch (error) {
+    // Stop renewing first. Cleanup bypasses a stop request, never lease ownership.
+    await stopHeartbeat().catch(() => {});
+    try {
+      const release = await io.cli(
+        [
+          'release',
+          '--run-id',
+          task.runId,
+          '--lease-id',
+          task.lease.leaseId,
+          '--event-id',
+          randomUUID(),
+          '--occurred-at',
+          new Date().toISOString(),
+        ],
+        { cleanup: true }
+      );
+      await io.emit({
+        type: 'worker_lease_released',
+        runId: task.runId,
+        release,
+      });
+    } catch (releaseError) {
+      await io.emit({
+        type: 'worker_release_pending',
+        runId: task.runId,
+        message:
+          'Lease cleanup could not be confirmed. Heartbeats stopped; server expiry will recover the slot.',
+      });
+    }
+    throw error;
+  } finally {
+    await stopHeartbeat();
   }
+  return {
+    status: outcomeStatus,
+    blockerCode: outcomeBlocker,
+    performance: recordedPerformance || metrics.snapshot(),
+  };
 }
 
 async function createProcessIo(options) {
   let signalStop = false;
-  let leaseDeadline = null;
+  const leaseDeadlines = new Map();
   const stopOnSignal = () => {
     signalStop = true;
   };
@@ -1198,10 +1531,10 @@ async function createProcessIo(options) {
         resolvePromise(parsed);
       });
     });
-  let heartbeatPromise = Promise.resolve();
   const startHeartbeat = (task) => {
     let stopped = false;
-    leaseDeadline = Date.parse(task.lease?.expiresAt);
+    let heartbeatPromise = Promise.resolve();
+    leaseDeadlines.set(task.runId, Date.parse(task.lease?.expiresAt));
     const interval = Math.max(
       10_000,
       Math.min(30_000, Number(task.lease?.heartbeatSeconds || 60) * 500)
@@ -1222,9 +1555,8 @@ async function createProcessIo(options) {
           if (
             renewed?.leaseId === task.lease.leaseId &&
             renewed?.leaseExpiresAt
-          ) {
-            leaseDeadline = Date.parse(renewed.leaseExpiresAt);
-          }
+          )
+            leaseDeadlines.set(task.runId, Date.parse(renewed.leaseExpiresAt));
         })
         .catch((error) =>
           emit({
@@ -1239,9 +1571,10 @@ async function createProcessIo(options) {
       stopped = true;
       clearInterval(timer);
       await heartbeatPromise;
-      leaseDeadline = null;
+      leaseDeadlines.delete(task.runId);
     };
   };
+  const stores = new Map();
   const uniquePath = (label, contents) => {
     const digest = createHash('sha256')
       .update(contents)
@@ -1250,9 +1583,23 @@ async function createProcessIo(options) {
     return join(stateDir, `${label}-${digest}`);
   };
   const io = {
-    checkControl: async () => {
+    performanceReporting: false,
+    sharedAssets: new Map(),
+    optimizationStore: (task) => {
+      const scope = task.productCache?.scope || 'memory';
+      if (!stores.has(scope))
+        stores.set(
+          scope,
+          createOptimizationStore({ scope }).catch(() =>
+            createOptimizationStore()
+          )
+        );
+      return stores.get(scope);
+    },
+    checkControl: async (runId) => {
+      const leaseDeadline = leaseDeadlines.get(runId);
       if (
-        leaseDeadline !== null &&
+        leaseDeadline !== undefined &&
         (!Number.isFinite(leaseDeadline) || Date.now() >= leaseDeadline)
       ) {
         throw Object.assign(
@@ -1287,7 +1634,7 @@ async function createProcessIo(options) {
       return path;
     },
   };
-  return options.fileTransport ? createFileTransport(io, options.stateDir) : io;
+  return options.fileTransport ? createFileTransport(io, stateDir) : io;
 }
 
 if (
@@ -1297,6 +1644,9 @@ if (
   const queueIds = process.argv.flatMap((value, index) =>
     value === '--queue-id' ? [process.argv[index + 1]] : []
   );
+  const resumeRunIds = process.argv.flatMap((value, index) =>
+    value === '--resume-run-id' ? [process.argv[index + 1]] : []
+  );
   if (['start', 'status', 'respond', 'stop'].includes(process.argv[2])) {
     await runTransportCommand({
       command: process.argv[2],
@@ -1304,7 +1654,11 @@ if (
       stateDir: argument('state-dir'),
       connection: argument('connection'),
       queueIds,
+      resumeRunIds,
+      concurrency: argument('concurrency'),
       receiptFile: argument('receipt-file'),
+      afterRevision: argument('after-revision'),
+      waitMs: argument('wait-ms'),
       beforeStart:
         process.argv[2] === 'start'
           ? async () => {
@@ -1340,7 +1694,11 @@ if (
       fileTransport: process.argv.includes('--file-transport'),
     });
     try {
-      await runSequentialSession(io, { queueIds });
+      await runSequentialSession(io, {
+        queueIds,
+        resumeRunIds,
+        concurrency: Number(argument('concurrency')) || undefined,
+      });
     } catch (error) {
       process.exitCode = error.code === 'RUNNER_STOPPED' ? 0 : 1;
       await io.emit({

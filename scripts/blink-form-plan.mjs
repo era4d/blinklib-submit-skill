@@ -4,6 +4,8 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { controlIdentity } from './blink-optimization.mjs';
+
 const ordinaryKinds = new Set(['text', 'textarea', 'email', 'url', 'number']);
 const sensitive =
   /password|passwd|one.?time|otp|verification|security code|recovery|api.?key|access.?token|secret|captcha|turnstile|密码|验证码|密钥|口令/i;
@@ -58,14 +60,53 @@ function companyIdentity(product) {
   };
 }
 
-function descriptionCandidates(product) {
-  const variants = clean(product.descriptionVariants)
-    .split(/\r?\n+/)
-    .map(clean)
-    .filter(Boolean);
-  return [product.description, ...variants, product.tagline]
-    .map(clean)
-    .filter(Boolean);
+// Crawled profile prose is evidence for composition, not a prepared answer.
+export function needsProseRewrite(field, value, product) {
+  if (
+    !(
+      ['long_text', 'textarea', 'article'].includes(field.type || field.kind) ||
+      /describ|description|summary|overview|about|介绍|描述|简介|概述/i.test(
+        `${field.key || ''} ${field.label || ''}`,
+      )
+    )
+  )
+    return false;
+  const text = clean(value);
+  if (!text) return false;
+  if (
+    /(?:^|\n)\s*(?:Website (?:title|description)\s*:|Site text\s*:)|<\/?(?:html|body|nav|footer|script)\b/i.test(
+      text,
+    ) ||
+    (field.type !== 'article' &&
+      /(?:^|\n)\s*Source\s*:\s*https?:\/\//i.test(text))
+  )
+    return true;
+  const normalize = (item) =>
+    clean(item)
+      .normalize('NFKC')
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, '');
+  const answer = normalize(text);
+  const cjk =
+    /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(
+      text,
+    );
+  if (answer.length < (cjk ? 8 : 16)) return false;
+  const width = Math.min(answer.length, cjk ? 12 : 24);
+  const sources = Object.values(product || {})
+    .filter((item) => typeof item === 'string')
+    .map(normalize)
+    .filter((item) => item.length >= width);
+  const copied = new Uint8Array(answer.length);
+  for (let index = 0; index <= answer.length - width; index++) {
+    if (
+      sources.some((source) =>
+        source.includes(answer.slice(index, index + width)),
+      )
+    )
+      copied.fill(1, index, index + width);
+  }
+  return copied.reduce((count, item) => count + item, 0) / answer.length >= 0.5;
 }
 
 function reusableValue(product, label, platformDomain) {
@@ -115,7 +156,24 @@ function preparedFieldValue(task, control) {
   const value = task.fieldAnswers[field.key];
   if (!['string', 'number', 'boolean'].includes(typeof value) || !clean(value))
     return null;
+  if (needsProseRewrite(field, value, task.product)) return null;
   return { value: clean(value), source: `fieldAnswers.${field.key}` };
+}
+
+function recipeFieldValue(task, control, recipe) {
+  const mapping = recipe?.fields?.find((field) => field.identity === controlIdentity(control));
+  const source = mapping?.source;
+  if (!source || !/^[a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_-]+){0,3}$/.test(source) ||
+    /__proto__|constructor|prototype/.test(source)) return null;
+  let value = source.startsWith('fieldAnswers.') || source.startsWith('product.')
+    ? task.product ? task : { product: task }
+    : task.product || task;
+  for (const key of source.split('.')) {
+    if (!value || typeof value !== 'object' || !Object.hasOwn(value, key)) return null;
+    value = value[key];
+  }
+  return ['string', 'number', 'boolean'].includes(typeof value) && clean(value)
+    ? { value: clean(value), source } : null;
 }
 
 function fieldFact(label, product) {
@@ -148,23 +206,10 @@ function fieldFact(label, product) {
     return result(product.contactEmail, 'contactEmail');
   if (
     exact(
-      /^(?:short |product |tool |startup |software |app |website |service )?(?:description|summary|about)$|^about (?:the )?(?:product|tool|startup|software|app|website|service)$|^产品描述$|^项目介绍$/
-    )
-  )
-    return result(
-      product.description,
-      'description',
-      descriptionCandidates(product)
-    );
-  if (
-    exact(
       /^(?:short )?(?:tagline|slogan|one liner|one line description|pitch)$|^标语$|^一句话介绍$/
     )
   )
-    return result(product.tagline, 'tagline', [
-      product.tagline,
-      ...descriptionCandidates(product),
-    ]);
+    return result(product.tagline, 'tagline');
   if (
     exact(
       /^(?:target )?(?:audience|users|customers|market)$|^who is (?:it|this) for$|^目标用户$|^目标市场$/
@@ -407,13 +452,15 @@ export function planFormFields(taskOrProduct, controls, options = {}) {
       companyNameField.test(normalized(label)) ||
       submitterNameField.test(normalized(label));
     const reusable = reusableValue(product, label, platformDomain);
-    const fact = canonicalName
+    let fact = canonicalName
       ? fieldFact(label, product)
       : preparedFieldValue(taskOrProduct, control) ||
+        recipeFieldValue(taskOrProduct, control, options.recipe) ||
         reusable ||
         (kind === 'email' && !nonSubmissionEmail.test(label)
           ? { value: clean(product.contactEmail), source: 'contactEmail' }
           : fieldFact(label, product));
+    if (fact && needsProseRewrite(control, fact.value, product)) fact = null;
     if (!fact?.value) {
       unresolved.push({
         ref,

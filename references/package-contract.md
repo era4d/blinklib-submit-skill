@@ -30,6 +30,9 @@ backlink-submit/
 |   |-- blink-browser.py
 |   |-- blink_session.py
 |   |-- blink-form-plan.mjs
+|   |-- blink-optimization.mjs
+|   |-- blink-cloud-sop.mjs
+|   |-- blink-runner-scheduler.mjs
 |   |-- blink-sequential-runner.mjs
 |   |-- blink-runner-transport.mjs
 |   |-- blink-skill-manager.mjs
@@ -39,6 +42,7 @@ backlink-submit/
     |-- api.md
     |-- automatic-browser.md
     |-- browser-execution.md
+    |-- cloud-sops.md
     |-- integrity-and-recovery.md
     |-- login-handoff.md
     |-- package-contract.md
@@ -60,7 +64,7 @@ Blink writes `connection.json` at download time with:
   "schemaVersion": 1,
   "appUrl": "https://blink.example",
   "apiKey": "<scoped-install-token>",
-  "clientVersion": "1.9.7"
+  "clientVersion": "1.11.0"
 }
 ```
 

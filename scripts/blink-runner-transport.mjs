@@ -58,11 +58,18 @@ async function checkStopped(stateDir) {
   }
 }
 
-export async function readRunnerStatus(stateDir) {
+export async function readRunnerStatus(stateDir, attempt = 0) {
   const state = await readJson(join(stateDir, 'state.json'));
   if (!state)
     return { type: 'runner_not_started', stateDir, continueRequired: false };
-  if (terminal.has(state.event?.type)) return { ...state, stateDir };
+  if (terminal.has(state.event?.type))
+    return {
+      ...state,
+      ...(state.event.type === 'campaign_finished'
+        ? { lastReceipt: undefined, lastReceipts: undefined }
+        : {}),
+      stateDir,
+    };
   const owner = await readJson(join(stateDir, 'owner.json'));
   if (!owner || Date.now() - Date.parse(owner.updatedAt) > 30_000) {
     return {
@@ -72,6 +79,11 @@ export async function readRunnerStatus(stateDir) {
       message:
         'The controller is no longer responding. Preserve its receipt and reconcile the lease; retain every unfinished tab with an applied field, accepted upload, advanced form step, or ambiguous final action.',
       pendingRequest: state.pendingRequest,
+      pendingRequests: state.pendingRequests,
+      activeLeases: state.activeLeases,
+      deliveries: state.deliveries,
+      claimDelivery: state.claimDelivery,
+      lastReceipts: state.lastReceipts,
       lastEvent: state.event,
       lastReceipt: state.lastReceipt,
       delivery: state.delivery,
@@ -80,7 +92,34 @@ export async function readRunnerStatus(stateDir) {
       pendingLogCount: state.pendingLogCount,
     };
   }
-  return { ...state, lastReceipt: undefined, stateDir };
+  const requests =
+    state.pendingRequests ||
+    (state.pendingRequest ? [state.pendingRequest] : []);
+  const delivered = await Promise.all(
+    requests.map(async (request) =>
+      /^[a-f0-9-]{36}$/i.test(request.requestId || '') &&
+      (await readJson(join(stateDir, `receipt-${request.requestId}.json`)))
+        ? request.requestId
+        : null
+    )
+  );
+  // A delivered receipt is being processed, not a request to repeat Submit.
+  // Re-read if the owner advanced while these receipt files were inspected.
+  const latest = await readJson(join(stateDir, 'state.json'));
+  if (attempt < 2 && latest?.revision !== state.revision)
+    return readRunnerStatus(stateDir, attempt + 1);
+  const pendingRequests = requests.filter(
+    (request) => !delivered.includes(request.requestId)
+  );
+  return {
+    ...state,
+    pendingRequests,
+    pendingRequest: pendingRequests[0] || null,
+    processingRequestIds: delivered.filter(Boolean),
+    lastReceipt: undefined,
+    lastReceipts: undefined,
+    stateDir,
+  };
 }
 
 // A detached process owns claims/heartbeats. The agent reconnects through small,
@@ -92,8 +131,10 @@ export async function createFileTransport(
 ) {
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   const startedAt = Date.now();
-  const checkClient = async () => {
-    await io.checkControl?.();
+  let cancelled = null;
+  const checkClient = async (runId) => {
+    if (cancelled) throw cancelled;
+    await io.checkControl?.(runId);
     await checkStopped(stateDir);
     const client = await readJson(join(stateDir, 'client.json'));
     const lastContact = client ? Date.parse(client.updatedAt) : startedAt;
@@ -101,25 +142,39 @@ export async function createFileTransport(
       !Number.isFinite(lastContact) ||
       Date.now() - lastContact > clientTimeoutMs
     ) {
-      const error = new Error(
-        'The agent stopped contacting this controller. Release its lease and preserve its browser receipt; do not close a tab with applied fields, accepted uploads, or an advanced form step.'
+      throw Object.assign(
+        new Error(
+          'The agent stopped contacting this controller. Release every owned lease and preserve progressed or confirmation-pending tabs.'
+        ),
+        { code: 'AGENT_DISCONNECTED' }
       );
-      error.code = 'AGENT_DISCONNECTED';
-      throw error;
     }
   };
   const outboxPath = join(stateDir, 'log-outbox.json');
   let outbox = (await readJson(outboxPath)) || [];
-  let lastFlush = 0;
+  let lastFlush = 0,
+    flushPromise = null;
   let state = {
     type: 'runner_active',
+    revision: 0,
     continueRequired: true,
     pendingRequest: null,
+    pendingRequests: [],
+    activeLeases: [],
+    deliveries: {},
     event: { type: 'runner_starting' },
     pendingLogCount: outbox.length,
   };
   let writes = Promise.resolve();
   const save = () => {
+    state.revision += 1;
+    state.pendingRequest = state.pendingRequests[0] || null;
+    state.activeLease = state.activeLeases[0] || null;
+    const pending = Object.values(state.deliveries);
+    state.delivery =
+      pending.find((entry) => entry.args[0] !== 'release') || null;
+    state.releaseDelivery =
+      pending.find((entry) => entry.args[0] === 'release') || null;
     const snapshot = structuredClone(state);
     writes = writes.then(() =>
       atomicJson(join(stateDir, 'state.json'), snapshot)
@@ -131,34 +186,63 @@ export async function createFileTransport(
       pid: process.pid,
       updatedAt: new Date().toISOString(),
     });
-  const saveOutbox = async () => {
-    await atomicJson(outboxPath, outbox);
+  let outboxWrites = Promise.resolve();
+  const saveOutbox = () => {
+    const snapshot = structuredClone(outbox);
     state.pendingLogCount = outbox.length;
-    await save();
+    outboxWrites = outboxWrites.then(() => atomicJson(outboxPath, snapshot));
+    return outboxWrites.then(save);
   };
   const hasPendingDelivery = (result) =>
     result?.deliveryPending === true ||
     result?.logPending === true ||
     result?.submissionSyncPending === true;
+  const queueDelivery = async (args) => {
+    const eventId = args.includes('--event-id')
+      ? args[args.indexOf('--event-id') + 1]
+      : null;
+    if (!eventId)
+      throw new Error('Pending delivery requires a stable event ID.');
+    outbox = [
+      ...outbox.filter((entry) => entry.eventId !== eventId),
+      { eventId, args },
+    ];
+    await saveOutbox();
+  };
   const flushDeliveries = async (force = false) => {
+    if (flushPromise) {
+      await flushPromise;
+      if (!force) return outbox.length;
+    }
     if (!outbox.length || (!force && Date.now() - lastFlush < 60_000))
       return outbox.length;
-    await checkClient();
-    lastFlush = Date.now();
-    const retained = [];
-    for (const entry of outbox) {
-      try {
-        // Replays the saved Blink event only. Browser actions are never involved.
-        const result = await io.cli(entry.args);
-        if (result?.accepted !== true || hasPendingDelivery(result))
-          retained.push(entry);
-      } catch {
-        retained.push(entry);
+    const flush = async () => {
+      await checkClient();
+      lastFlush = Date.now();
+      // Remove only acknowledged IDs. New concurrent entries must survive a flush.
+      for (const entry of [...outbox]) {
+        try {
+          const result = await io.cli(entry.args);
+          if (
+            (result?.accepted === true ||
+              result?.deferred === true ||
+              result?.released === true) &&
+            !hasPendingDelivery(result)
+          )
+            outbox = outbox.filter((item) => item.eventId !== entry.eventId);
+        } catch {
+          /* Replay only this event on the next flush. */
+        }
       }
+      await saveOutbox();
+      return outbox.length;
+    };
+    flushPromise = flush();
+    try {
+      return await flushPromise;
+    } finally {
+      flushPromise = null;
     }
-    outbox = retained;
-    await saveOutbox();
-    return outbox.length;
   };
   await touch();
   await save();
@@ -169,32 +253,40 @@ export async function createFileTransport(
     try {
       await touch();
     } catch {
-      /* status becomes stale if storage fails */
+      /* status will expose a stale controller */
     } finally {
       touching = false;
     }
   }, 5_000);
   timer.unref();
   const emit = async (event) => {
-    // Heartbeats must not overwrite the browser request or its correction.
-    if (event.type === 'heartbeat_failed') {
-      state = { ...state, heartbeatError: event };
-    } else {
-      state = { ...state, event, continueRequired: !terminal.has(event.type) };
+    if (event.type === 'heartbeat_failed') state.heartbeatError = event;
+    else {
+      state.event = event;
+      state.continueRequired = !terminal.has(event.type);
+    }
+    if (event.type === 'task_settled') {
+      state.pendingRequests = state.pendingRequests.filter(
+        (request) => (request.runId || request.task?.runId) !== event.runId
+      );
+      state.activeLeases = state.activeLeases.filter(
+        (lease) => lease.runId !== event.runId
+      );
+    }
+    if (
+      event.type === 'worker_lease_released' &&
+      (event.release?.released === true || event.release?.accepted === true)
+    ) {
+      state.activeLeases = state.activeLeases.filter(
+        (lease) => lease.runId !== event.runId
+      );
+      state.leaseReleased = state.activeLeases.length === 0;
     }
     if (terminal.has(event.type)) {
       state.type = event.type;
-      // Keep the unfinished request for recovery on failure.
-      if (event.type === 'campaign_finished') state.pendingRequest = null;
+      if (event.type === 'campaign_finished') state.pendingRequests = [];
       clearInterval(timer);
     }
-    if (event.type === 'task_settled') {
-      state.pendingRequest = null;
-      state.activeLease = null;
-    }
-    if (event.type === 'worker_lease_released')
-      state.leaseReleased =
-        event.release?.released === true || event.release?.accepted === true;
     await save();
     if (terminal.has(event.type))
       await rmdir(join(stateDir, 'lock')).catch(() => {});
@@ -202,83 +294,125 @@ export async function createFileTransport(
   };
   return {
     ...io,
+    concurrentRequests: true,
     emit,
+    queueDelivery,
     flushDeliveries,
+    cancelPending: (error) => {
+      cancelled = error;
+    },
     cli: async (args, behavior) => {
       const cleanup = behavior?.cleanup === true && args[0] === 'release';
-      if (!cleanup) await checkClient();
-      const delivery = ['result', 'defer', 'release'].includes(args[0]);
-      const deliveryKey =
-        args[0] === 'release' ? 'releaseDelivery' : 'delivery';
+      const runId = args.includes('--run-id')
+        ? args[args.indexOf('--run-id') + 1]
+        : null;
+      if (!cleanup)
+        await checkClient(
+          ['log', 'answers'].includes(args[0]) ? runId : undefined
+        );
+      const claiming = ['next', 'next-batch', 'resume'].includes(args[0]);
+      if (claiming) {
+        state.claimDelivery = { args };
+        await save();
+      }
+      const delivery = ['result', 'defer', 'release', 'performance'].includes(
+        args[0]
+      );
+      const deliveryKey = `${args[0]}:${runId}`;
       if (delivery) {
-        state[deliveryKey] = { args };
+        state.deliveries[deliveryKey] = { args };
         await save().catch((error) => {
           if (!cleanup) throw error;
         });
       }
       const result = await io.cli(args, behavior);
       if (
-        ['next', 'resume'].includes(args[0]) &&
-        result?.runId &&
-        result?.lease?.leaseId
-      ) {
-        state.activeLease = {
-          runId: result.runId,
-          leaseId: result.lease.leaseId,
-        };
+        claiming &&
+        (result === null ||
+          result?.runId ||
+          result?.claim === null ||
+          Array.isArray(result?.claims))
+      )
+        state.claimDelivery = null;
+      const claims =
+        args[0] === 'next-batch'
+          ? result?.claims || []
+          : ['next', 'resume'].includes(args[0])
+            ? [result]
+            : [];
+      const issued = claims.filter(
+        (task) =>
+          task?.runId &&
+          (task?.lease?.leaseId || task?.leaseId) &&
+          task.leaseReleased !== true
+      );
+      if (issued.length) {
+        state.activeLeases.push(
+          ...issued.map((task) => ({
+            runId: task.runId,
+            leaseId: task.lease?.leaseId || task.leaseId,
+          }))
+        );
+        state.leaseReleased = false;
         try {
           await save();
         } catch (error) {
-          // A claimed task must not be leaked because local state storage failed.
-          await io
-            .cli(
-              [
-                'release',
-                '--run-id',
-                result.runId,
-                '--lease-id',
-                result.lease.leaseId,
-                '--event-id',
-                randomUUID(),
-                '--occurred-at',
-                new Date().toISOString(),
-              ],
-              { cleanup: true }
+          await Promise.allSettled(
+            issued.map((task) =>
+              io.cli(
+                [
+                  'release',
+                  '--run-id',
+                  task.runId,
+                  '--lease-id',
+                  task.lease?.leaseId || task.leaseId,
+                  '--event-id',
+                  randomUUID(),
+                  '--occurred-at',
+                  new Date().toISOString(),
+                ],
+                { cleanup: true }
+              )
             )
-            .catch(() => {});
+          );
           throw error;
         }
       }
       if (delivery) {
         if (
-          ['result', 'release'].includes(args[0]) &&
-          result?.accepted === true &&
+          (result?.accepted === true || result?.deferred === true) &&
           hasPendingDelivery(result)
-        ) {
-          const eventId = args[args.indexOf('--event-id') + 1];
-          if (!args.includes('--event-id') || !eventId)
-            throw new Error('Pending log delivery requires a stable event ID.');
-          outbox = [
-            ...outbox.filter((entry) => entry.eventId !== eventId),
-            { eventId, args },
-          ];
-          await saveOutbox();
-        }
-        state[deliveryKey] = null;
+        )
+          await queueDelivery(args);
+        delete state.deliveries[deliveryKey];
         await save();
       }
       return result;
     },
     request: async (request) => {
-      state.pendingRequest = request;
+      const runId = request.runId || request.task?.runId;
+      state.pendingRequests = [
+        ...state.pendingRequests.filter(
+          (item) => item.requestId !== request.requestId
+        ),
+        request,
+      ];
       await emit(request);
       const receiptPath = join(stateDir, `receipt-${request.requestId}.json`);
       while (true) {
-        await checkClient();
+        await checkClient(runId);
         const receipt = await readJson(receiptPath);
         if (receipt) {
           state.lastReceipt = { request, receipt };
-          state.pendingRequest = null;
+          state.lastReceipts = [
+            ...(state.lastReceipts || []).filter(
+              (entry) => entry.request.requestId !== request.requestId
+            ),
+            state.lastReceipt,
+          ].slice(-20);
+          state.pendingRequests = state.pendingRequests.filter(
+            (item) => item.requestId !== request.requestId
+          );
           await save();
           await unlink(receiptPath);
           return receipt;
@@ -291,7 +425,9 @@ export async function createFileTransport(
 
 export async function submitRunnerReceipt(stateDir, receipt) {
   const state = await readRunnerStatus(stateDir);
-  const pending = state.pendingRequest;
+  const pending = (state.pendingRequests || [state.pendingRequest]).find(
+    (request) => request?.requestId === receipt?.requestId
+  );
   if (
     state.continueRequired !== true ||
     !pending ||
@@ -324,6 +460,44 @@ export async function submitRunnerReceipt(stateDir, receipt) {
   };
 }
 
+export async function submitRunnerReceipts(stateDir, receipts) {
+  if (
+    !Array.isArray(receipts) ||
+    receipts.length < 1 ||
+    receipts.length > 50 ||
+    new Set(receipts.map((receipt) => receipt?.requestId)).size !==
+      receipts.length
+  )
+    throw new Error('Provide 1 to 50 receipts with distinct request IDs.');
+  const state = await readRunnerStatus(stateDir);
+  const pending = state.pendingRequests || [state.pendingRequest];
+  if (
+    state.continueRequired !== true ||
+    receipts.some(
+      (receipt) =>
+        !pending.some((request) => request?.requestId === receipt?.requestId)
+    )
+  )
+    throw new Error(
+      'Every receipt must match a current live request. Read status without replaying browser actions.'
+    );
+  const deliveredRequestIds = [];
+  try {
+    for (const receipt of receipts) {
+      await submitRunnerReceipt(stateDir, receipt);
+      deliveredRequestIds.push(receipt.requestId);
+    }
+  } catch (error) {
+    error.message += ` Already delivered: ${deliveredRequestIds.join(', ') || 'none'}. Read status and deliver only missing receipts.`;
+    throw error;
+  }
+  return {
+    type: 'receipts_delivered',
+    deliveredRequestIds,
+    continueRequired: true,
+  };
+}
+
 export async function runTransportCommand(options) {
   const identity = createHash('sha256')
     .update(
@@ -352,16 +526,44 @@ export async function runTransportCommand(options) {
   } else if (options.command === 'respond') {
     if (!options.receiptFile)
       throw new Error('respond requires --receipt-file PATH.');
-    output = await submitRunnerReceipt(
-      stateDir,
-      JSON.parse(await readFile(resolve(options.receiptFile), 'utf8'))
+    const receipts = JSON.parse(
+      await readFile(resolve(options.receiptFile), 'utf8')
     );
+    output = Array.isArray(receipts)
+      ? await submitRunnerReceipts(stateDir, receipts)
+      : await submitRunnerReceipt(stateDir, receipts);
   } else if (options.command === 'status') {
-    output = await readRunnerStatus(stateDir);
+    const revision = options.afterRevision;
+    const deadline =
+      Date.now() + Math.min(25_000, Math.max(0, Number(options.waitMs) || 0));
+    do {
+      output = await readRunnerStatus(stateDir);
+      if (
+        revision === undefined ||
+        output.revision !== Number(revision) ||
+        output.continueRequired !== true
+      )
+        break;
+      if (Date.now() >= deadline) break;
+      await delay(200);
+    } while (true);
   } else {
     const prior = await readJson(join(stateDir, 'state.json'));
     const priorScope = await readJson(join(stateDir, 'scope.json'));
-    const scope = [...options.queueIds].sort();
+    const queues = [...options.queueIds].sort();
+    const resumes = [...new Set(options.resumeRunIds || [])].sort();
+    if (
+      resumes.length > 50 ||
+      resumes.some((id) => typeof id !== 'string' || !id || id.length > 200)
+    )
+      throw new Error('Provide at most 50 approved resume run IDs.');
+    const concurrency =
+      options.concurrency === undefined ? 3 : Number(options.concurrency);
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 3)
+      throw new Error('--concurrency must be an integer from 1 to 3.');
+    const scope = resumes.length
+      ? { queueIds: queues, resumeRunIds: resumes }
+      : queues;
     if (
       prior &&
       prior.event?.type !== 'campaign_finished' &&
@@ -406,7 +608,9 @@ export async function runTransportCommand(options) {
         ];
         if (options.connection)
           args.push('--connection', resolve(options.connection));
-        for (const id of scope) args.push('--queue-id', id);
+        for (const id of queues) args.push('--queue-id', id);
+        for (const id of resumes) args.push('--resume-run-id', id);
+        args.push('--concurrency', String(concurrency));
         const child = spawn(process.execPath, args, {
           detached: true,
           windowsHide: true,

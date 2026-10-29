@@ -15,7 +15,7 @@ import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-const CLIENT_VERSION = '1.9.7';
+const CLIENT_VERSION = '1.11.0';
 const SKILL_ID = 'backlink-submit';
 const MAX_RELEASE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_HISTORY_LIMIT = 3;
@@ -184,6 +184,10 @@ function validateRelease(release) {
   }
 
   const entries = Object.entries(release.files);
+  for (const dependency of ['blink-optimization.mjs', 'blink-runner-scheduler.mjs', 'blink-cloud-sop.mjs']) {
+    if (entries.some(([path, source]) => path.endsWith('.mjs') && typeof source === 'string' && source.includes(`./${dependency}`)) &&
+      typeof release.files[`scripts/${dependency}`] !== 'string') throw new Error(`Blink Skill release is missing scripts/${dependency}.`);
+  }
   if (!entries.length) throw new Error('Blink returned an empty Skill release.');
   for (const [path, content] of entries) {
     const normalized = path.replaceAll('\\', '/');
@@ -252,6 +256,13 @@ async function validateGitRelease(root) {
   ]) {
     const details = await stat(join(root, ...required.split('/'))).catch(() => null);
     if (!details?.isFile()) throw new Error(`Git Skill is missing ${required}.`);
+  }
+  const sources = await Promise.all(['blink-sequential-runner.mjs', 'blink-form-plan.mjs'].map((name) => readFile(join(root, 'scripts', name), 'utf8').catch(() => '')));
+  for (const dependency of ['blink-optimization.mjs', 'blink-runner-scheduler.mjs', 'blink-cloud-sop.mjs']) {
+    if (sources.some((source) => source.includes(`./${dependency}`))) {
+      const details = await stat(join(root, 'scripts', dependency)).catch(() => null);
+      if (!details?.isFile()) throw new Error(`Git Skill is missing scripts/${dependency}.`);
+    }
   }
   return release;
 }

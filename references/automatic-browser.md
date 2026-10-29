@@ -2,13 +2,13 @@
 
 Use this reference while `blink-sequential-runner.mjs` owns an automatic campaign. Run `start` once (or reconnect with it), then alternate `status` and `respond --receipt-file PATH`. The hidden process owns the queue and heartbeats; browser actions remain in the agent's selected browser runtime. Do not stream JSON through a PTY. Write UTF-8 JSON files with literal-safe file tools.
 
-`status` returns the full `pendingRequest`, including its exact `requestId`. If there is no request and `continueRequired` is true, wait briefly and read status again. A transient empty request does not mean completion. `respond` validates request ownership and delivers the file atomically; `receipt_delivered` is not a batch result. Read status immediately afterward and continue without a user turn.
+`status` returns all `pendingRequests` and the first request as `pendingRequest`, each with its own exact `requestId` and task/tab context. Up to three workers overlap preparation and independent browser work. Do not run two actions concurrently in the same tab. `respond` accepts a single JSON receipt or an array (one receipt per exact request). If no state changed, call `status --after-revision REVISION --wait-ms 20000`. A transient empty request does not mean completion. Delivery acknowledgments are not batch results; continue until the controller finishes.
 
 If a receipt has the wrong shape, status returns a correction for the same request with `receiptOnly: true`. Correct the receipt from observed evidence; never repeat a final action or upload. A descriptive `reason` is not a protocol enum: use `message` for prose. The controller derives the deferral reason from `blockerCode`.
 
 The state directory preserves the pending request, last browser receipt, and undelivered Blink command. After interruption, reconnect to the same state. Retain every unfinished task tab once it has material form progress, regardless of authentication or blocker type. Material progress means at least one applied field, accepted upload, or advanced form step. There is no one-tab limit. Close only untouched and explicitly completed tabs. Never restart an external submission to repair delivery. Codex in-app tabs created by the agent are turn-temporary: for each acknowledged blocker whose `tabDisposition` is `"preserved"`, call the exact tab's `markHandoff()` immediately and again before every turn end until the user finishes or the task is settled. Merely omitting `close()` does not preserve that tab.
 
-For `runner_recovery_required`, `activeLease` contains the original run/lease IDs. Release that exact lease with the packaged client before creating a fresh controller state directory. Preserve the previous directory and any result delivery for receipt reconciliation. This cleanup does not require another user turn; do not edit a stale owner's lease to the new worker's ID.
+For `runner_recovery_required`, `activeLeases` contains every original run/lease pair (`activeLease` is the first for older callers). Reconcile all `deliveries`, `lastReceipts` and any unresolved `claimDelivery`; release every exact owned lease before creating a fresh controller state directory. Preserve the previous directory and receipts. This cleanup does not require another user turn; never release a replacement owner's lease. If the claim response itself is unknown, inspect the queue/logs rather than claiming again.
 
 Only when the user cancels, call `stop` and read status until `runner_stopped`. It stops claiming and heartbeating and releases its owned lease. Keep the receipt; apply the normal tab-retention policy. Do not use stop to finish a normal tool call.
 
@@ -23,6 +23,8 @@ Remote Chrome, Tabbit, and Codex in-app/CUA tabs are browser runtimes. Windows C
 Never manufacture a runtime blocker from a policy prediction. The controller and Blink server reject runtime blockers without a concrete tool receipt.
 
 ## Receipts
+
+For tasks with `sopKnowledge.enabled`, also follow [cloud-sops.md](cloud-sops.md): include the observed form language in inspections and an ordered `workflowTrace` in successful resolution receipts. Record steps while executing them; repair the receipt from existing observations without replaying Submit.
 
 Before `open_and_inspect`, the controller emits `task_prepared` and puts versioned project facts, cache status, saved/generated `fieldAnswers`, and `answerPreparation` in the task. `answerPreparation` reports known values, requested questions, and the API context receipt. A generation failure leaves known facts usable and is reported as `answer_request_failed`; do not infer that the project itself is missing. The later resolution request repeats the product facts as `productContext` and identifies safe narrative gaps in `groundedAnswerPolicy.composableFields`. Write those answers from the supplied facts and fill them directly; do not return `missing_required_fact` merely because the answer API had no value. Values and local cache paths stay out of progress logs.
 
@@ -63,6 +65,8 @@ For `resolve_then_submit_or_block`, return one of:
 ```
 
 Every blocker receipt must include `formProgress` and `tabDisposition`. `filledFieldCount` and `acceptedUploadCount` are non-negative integers and `advancedStep` is boolean. Count only successful changes observed in the current task tab. The resolution request's `knownFormProgress` carries field writes already verified by the controller across earlier steps and reinspections. If either progress object shows any change, use `tabDisposition: "preserved"`; otherwise use `"closed"`. The controller rejects a later `"closed"` blocker even if the final receipt incorrectly reports zero progress.
+
+Exception: an already-open tab awaiting a real browser-tool confirmation or legacy assisted final review must always use `tabDisposition: "preserved"`, including with zero form progress. The controller reports `status: "awaiting_confirmation"` to Blink using the `confirmation` resume phase before rotating. Keep the tab available for the user's decision and mark Codex in-app tabs for handoff immediately after the acknowledged deferral. Other blockers retain their own states. Do not manufacture confirmation requests for ordinary authorized automatic actions.
 
 ```json
 {"type":"blocker","requestId":"...","blockerCode":"captcha","resumePhase":"verification","currentUrl":"https://directory.example/form","formProgress":{"filledFieldCount":4,"acceptedUploadCount":1,"advancedStep":true},"tabDisposition":"preserved"}
